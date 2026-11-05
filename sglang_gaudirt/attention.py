@@ -84,7 +84,9 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
             raise ValueError("GaudiRT attention supports unquantized causal full attention only")
         rows = q.shape[0]
         return torch.ops.gaudirt._paged_attn_validated.default(
-            q.reshape(rows, -1), k.reshape(rows, -1), v.reshape(rows, -1),
+            q if q.ndim == 2 else q.reshape(rows, -1),
+            k if k.ndim == 2 else k.reshape(rows, -1),
+            v if v.ndim == 2 else v.reshape(rows, -1),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
             self.row_locations, self.row_requests, self.rotary_positions, self.request_mapping,

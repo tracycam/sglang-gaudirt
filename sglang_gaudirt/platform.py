@@ -30,6 +30,9 @@ class GaudiRTSRTPlatform(SRTPlatform):
     def get_default_attention_backend(self):
         return "gaudirt"
 
+    def attention_accepts_flat_kv(self):
+        return True
+
     def apply_server_args_defaults(self, server_args):
         if server_args.page_size not in (None, 1):
             raise ValueError("GaudiRT currently supports KV page size 1 only")
