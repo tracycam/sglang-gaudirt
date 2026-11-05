@@ -50,7 +50,7 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         else:
             raise ValueError("GaudiRT attention supports extend and decode only")
         pool = self.token_to_kv_pool
-        self.metadata = torch.classes.gaudirt.PagedMetadata.from_device_with_tokens(
+        self.metadata = torch.classes.gaudirt.PagedMetadata._from_scheduler(
             forward_batch.out_cache_loc,
             forward_batch.req_pool_indices,
             forward_batch.positions,

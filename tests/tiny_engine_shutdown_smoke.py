@@ -81,6 +81,13 @@ def main():
         disable_overlap_schedule=True, chunked_prefill_size=-1, log_level="info",
     )
     try:
+        for invalid in (-1, 128, 1 << 32):
+            try:
+                engine.generate(input_ids=[3, invalid], sampling_params=dict(temperature=0, max_new_tokens=1))
+            except ValueError as error:
+                assert "outside the model vocabulary" in str(error), str(error)
+            else:
+                raise AssertionError(f"out-of-vocabulary token {invalid} was accepted")
         for rows in (1, 19, 137):
             result = engine.generate(
                 input_ids=[3 + i % 125 for i in range(rows)],

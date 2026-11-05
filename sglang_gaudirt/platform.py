@@ -30,6 +30,13 @@ class GaudiRTSRTPlatform(SRTPlatform):
     def get_default_attention_backend(self):
         return "gaudirt"
 
+    def validate_input_token_ids(self, input_ids, vocabulary_size):
+        if vocabulary_size <= 0 or any(sequence is None for sequence in input_ids) or any(
+            token < 0 or token >= vocabulary_size
+            for sequence in input_ids for token in sequence
+        ):
+            raise ValueError("GaudiRT input token ID is outside the model vocabulary")
+
     def attention_accepts_flat_kv(self):
         return True
 

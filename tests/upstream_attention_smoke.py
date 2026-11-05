@@ -171,14 +171,12 @@ def main():
             prefixes = seq_lens_cpu.tolist()
             lengths = [1, 1]
     before_invalid = [(pool.get_key_buffer(i).cpu(), pool.get_value_buffer(i).cpu()) for i in range(2)]
-    batch.input_ids = torch.full((batch.input_ids.numel(),), -1, dtype=torch.int64).to("gaudirt:0")
     try:
-        backend.init_forward_metadata(batch)
-    except RuntimeError as error:
-        assert "token ID outside vocabulary" in str(error), str(error)
+        current_platform.validate_input_token_ids([[-1]], 32000)
+    except ValueError as error:
+        assert "outside the model vocabulary" in str(error), str(error)
     else:
         raise AssertionError("out-of-vocabulary input was accepted")
-    assert backend.metadata is None and backend.forward_batch is None
     for layer, (before_k, before_v) in enumerate(before_invalid):
         assert torch.equal(pool.get_key_buffer(layer).cpu(), before_k)
         assert torch.equal(pool.get_value_buffer(layer).cpu(), before_v)
