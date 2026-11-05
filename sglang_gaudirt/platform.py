@@ -42,6 +42,11 @@ class GaudiRTSRTPlatform(SRTPlatform):
         return backend.last_token_indices
 
     def apply_server_args_defaults(self, server_args):
+        if any(getattr(server_args, name) != 1 for name in (
+            "tp_size", "pp_size", "dp_size", "nnodes",
+            "tokenizer_worker_num", "detokenizer_worker_num",
+        )):
+            raise ValueError("GaudiRT currently requires one device and one tokenizer/detokenizer worker")
         if server_args.page_size not in (None, 1):
             raise ValueError("GaudiRT currently supports KV page size 1 only")
         server_args.page_size = 1
@@ -71,6 +76,9 @@ class GaudiRTSRTPlatform(SRTPlatform):
         from gaudirt.compiler import compile
 
         return compile(forward, dynamic_arg_indices=(0, 1))
+
+    def requires_graceful_worker_shutdown(self):
+        return True
 
     def write_req_to_token_pool(
         self, pool, request_indices, prefix_lengths, extend_lengths, prefixes, locations,
