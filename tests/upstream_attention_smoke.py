@@ -70,7 +70,8 @@ def main():
     backend = GaudiRTPagedAttnBackend(runner)
     layers = [RadixAttention(HEADS, DIM, SCALE, KV_HEADS, layer_id=i) for i in range(2)]
     rope = RotaryEmbedding(DIM, DIM, CONTEXT, 10000, True, torch.bfloat16)
-    initial_cache = rope.cos_sin_cache.clone()
+    assert rope.cos_sin_cache.device.type == "gaudirt"
+    initial_cache = rope.cos_sin_cache.cpu().clone()
     print("initial RoPE table hash", tensor_hash(initial_cache), flush=True)
     norm = RMSNorm(DIM, eps=1e-6, weight_dtype=torch.bfloat16)
     norm.weight = torch.nn.Parameter(torch.ones(DIM, dtype=torch.bfloat16, device="gaudirt:0"),

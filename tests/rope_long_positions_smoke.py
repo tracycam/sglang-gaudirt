@@ -50,7 +50,8 @@ def main():
     backend = GaudiRTPagedAttnBackend(SimpleNamespace(req_to_token_pool=req_pool, token_to_kv_pool=pool))
     backend.init_forward_metadata(batch)
     rope = RotaryEmbedding(support.DIM, support.DIM, support.CONTEXT, 10000, True, torch.bfloat16)
-    initial_cache = rope.cos_sin_cache.clone()
+    assert rope.cos_sin_cache.device.type == "gaudirt"
+    initial_cache = rope.cos_sin_cache.cpu().clone()
     q_cpu = torch.randn(rows, support.Q_WIDTH, dtype=torch.bfloat16)
     k_cpu = torch.randn(rows, support.KV_WIDTH, dtype=torch.bfloat16)
     with forward_context(ForwardContext(backend)):
