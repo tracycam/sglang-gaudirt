@@ -51,6 +51,17 @@ class GaudiRTSRTPlatform(SRTPlatform):
             raise ValueError("GaudiRT does not support compilation modes")
         return "gaudirt"
 
+    def write_req_to_token_pool(
+        self, pool, request_indices, prefix_lengths, extend_lengths, prefixes, locations,
+        *, is_encoder_decoder=False,
+    ):
+        if is_encoder_decoder:
+            raise ValueError("GaudiRT supports decoder-only request mappings")
+        from .req_to_token import write_req_to_token_pool
+
+        write_req_to_token_pool(pool, request_indices, prefix_lengths, extend_lengths, prefixes, locations)
+        return True
+
     def get_device_total_memory(self, device_id=0):
         if device_id != 0:
             raise ValueError("GaudiRT supports device 0 only")
