@@ -47,7 +47,9 @@ def main():
         seq_lens_sum=int(seq_lens_cpu.sum()), seq_lens_cpu=seq_lens_cpu,
         positions=positions, extend_prefix_lens_cpu=prefixes, extend_seq_lens_cpu=lengths,
     )
-    backend = GaudiRTPagedAttnBackend(SimpleNamespace(req_to_token_pool=req_pool, token_to_kv_pool=pool))
+    backend = GaudiRTPagedAttnBackend(SimpleNamespace(
+        req_to_token_pool=req_pool, token_to_kv_pool=pool, model_config=SimpleNamespace(vocab_size=32000)
+    ))
     backend.init_forward_metadata(batch)
     rope = RotaryEmbedding(support.DIM, support.DIM, support.CONTEXT, 10000, True, torch.bfloat16)
     assert rope.cos_sin_cache.device.type == "gaudirt"

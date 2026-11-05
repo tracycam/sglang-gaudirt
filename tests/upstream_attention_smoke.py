@@ -66,7 +66,8 @@ def main():
     mapping = torch.zeros((REQUESTS + 1, CONTEXT), dtype=torch.int32)
     mapping[1:] = torch.arange(1, SLOTS, dtype=torch.int32).reshape(REQUESTS, CONTEXT)
     req_pool.req_to_token.copy_(mapping)
-    runner = SimpleNamespace(req_to_token_pool=req_pool, token_to_kv_pool=pool)
+    runner = SimpleNamespace(req_to_token_pool=req_pool, token_to_kv_pool=pool,
+                             model_config=SimpleNamespace(vocab_size=32000))
     backend = GaudiRTPagedAttnBackend(runner)
     layers = [RadixAttention(HEADS, DIM, SCALE, KV_HEADS, layer_id=i) for i in range(2)]
     rope = RotaryEmbedding(DIM, DIM, CONTEXT, 10000, True, torch.bfloat16)
@@ -124,6 +125,8 @@ def main():
                 positions=positions, extend_prefix_lens_cpu=prefixes, extend_seq_lens_cpu=lengths,
             )
             backend.init_forward_metadata(batch)
+            assert batch.input_ids.shape == (len(positions_cpu),)
+            assert getattr(batch.input_ids, "_gaudirt_validated_vocab") == 32000
             q_cpu = torch.randn((len(positions_cpu), Q_WIDTH), dtype=torch.bfloat16)
             k_cpu = torch.randn((len(positions_cpu), KV_WIDTH), dtype=torch.bfloat16)
             v_cpu = torch.randn((len(positions_cpu), KV_WIDTH), dtype=torch.bfloat16)
@@ -164,6 +167,18 @@ def main():
                   "recipe stats", gaudirt.recipe_cache_stats(), flush=True)
             prefixes = seq_lens_cpu.tolist()
             lengths = [1, 1]
+    before_invalid = [(pool.get_key_buffer(i).cpu(), pool.get_value_buffer(i).cpu()) for i in range(2)]
+    batch.input_ids = torch.full((batch.input_ids.numel(),), -1, dtype=torch.int64).to("gaudirt:0")
+    try:
+        backend.init_forward_metadata(batch)
+    except RuntimeError as error:
+        assert "token ID outside vocabulary" in str(error), str(error)
+    else:
+        raise AssertionError("out-of-vocabulary input was accepted")
+    assert backend.metadata is None and backend.forward_batch is None
+    for layer, (before_k, before_v) in enumerate(before_invalid):
+        assert torch.equal(pool.get_key_buffer(layer).cpu(), before_k)
+        assert torch.equal(pool.get_value_buffer(layer).cpu(), before_v)
     counts = gaudirt.recipe_cache_stats()
     if os.environ.get("GAUDIRT_TEST_CACHE") == "cold":
         assert counts[0] == 0 and counts[1] > 0, counts

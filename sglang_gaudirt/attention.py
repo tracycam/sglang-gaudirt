@@ -1,6 +1,7 @@
 """Paged attention using SGLang's real request and KV pools."""
 
 import torch
+import gaudirt
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
@@ -17,6 +18,9 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
             raise ValueError("GaudiRT attention requires an NHD MHA KV pool")
         if pool.dtype != torch.bfloat16 or pool.v_head_dim != pool.head_dim:
             raise ValueError("GaudiRT attention requires matching BF16 K/V heads")
+        self.vocabulary = model_runner.model_config.vocab_size
+        if not isinstance(self.vocabulary, int) or self.vocabulary <= 0:
+            raise ValueError("GaudiRT attention requires a positive model vocabulary")
         self.metadata = None
         self.forward_batch = None
         self.positions = None
@@ -25,6 +29,8 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         self.rotary_context = None
 
     def init_forward_metadata(self, forward_batch):
+        self.metadata = self.forward_batch = self.positions = None
+        self.rotary_positions = self.rotary_header = self.rotary_context = None
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             prefixes = forward_batch.extend_prefix_lens_cpu
             lengths = forward_batch.extend_seq_lens_cpu
@@ -38,7 +44,7 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         else:
             raise ValueError("GaudiRT attention supports extend and decode only")
         pool = self.token_to_kv_pool
-        self.metadata = torch.classes.gaudirt.PagedMetadata.from_device(
+        self.metadata = torch.classes.gaudirt.PagedMetadata.from_device_with_tokens(
             forward_batch.out_cache_loc,
             forward_batch.req_pool_indices,
             forward_batch.positions,
@@ -46,7 +52,11 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
             prefixes,
             lengths,
             pool.get_key_buffer(pool.start_layer).size(0),
+            forward_batch.input_ids,
+            self.vocabulary,
         )
+        forward_batch.input_ids = gaudirt.validated_token_ids(self.metadata)
+        torch._dynamo.mark_dynamic(forward_batch.input_ids, 0, min=1, max=4096)
         self.forward_batch = forward_batch
         self.positions = forward_batch.positions
         self.rotary_positions = self.metadata.rotary_positions()
