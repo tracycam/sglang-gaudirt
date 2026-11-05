@@ -67,6 +67,11 @@ class GaudiRTSRTPlatform(SRTPlatform):
             raise ValueError("GaudiRT does not support compilation modes")
         return "gaudirt"
 
+    def prepare_model_forward(self, forward):
+        from gaudirt.compiler import compile
+
+        return compile(forward, dynamic_arg_indices=(0, 1))
+
     def write_req_to_token_pool(
         self, pool, request_indices, prefix_lengths, extend_lengths, prefixes, locations,
         *, is_encoder_decoder=False,
