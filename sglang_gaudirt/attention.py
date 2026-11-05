@@ -20,6 +20,9 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         self.metadata = None
         self.forward_batch = None
         self.positions = None
+        self.rotary_positions = None
+        self.rotary_header = None
+        self.rotary_context = None
 
     def init_forward_metadata(self, forward_batch):
         if forward_batch.forward_mode == ForwardMode.EXTEND:
@@ -46,6 +49,9 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         )
         self.forward_batch = forward_batch
         self.positions = forward_batch.positions
+        self.rotary_positions = self.metadata.rotary_positions()
+        self.rotary_header = self.metadata.rotary_header()
+        self.rotary_context = self.metadata.context()
 
     def _forward(self, q, k, v, layer, forward_batch, save_kv_cache, kwargs):
         if self.metadata is None or forward_batch is not self.forward_batch:

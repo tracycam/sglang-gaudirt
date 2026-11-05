@@ -26,9 +26,9 @@ def rotary_embedding(self, positions, query, key, offsets=None, fused_set_kv_buf
     if backend.metadata is None or positions is not backend.positions:
         raise RuntimeError("GaudiRT RoPE requires the active batch's validated positions")
     self._match_cos_sin_cache_dtype(query)
-    return torch.ops.gaudirt.rotary_embedding.default(
-        query, key, self.cos_sin_cache, backend.metadata,
-        self.head_size, self.rotary_dim, self.is_neox_style,
+    return torch.ops.gaudirt._rotary_embedding_validated.default(
+        query, key, self.cos_sin_cache, backend.rotary_positions, backend.rotary_header,
+        backend.rotary_context, self.head_size, self.rotary_dim, self.is_neox_style,
     )
 
 
