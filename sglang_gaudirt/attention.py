@@ -52,6 +52,7 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         self.rotary_positions = self.metadata.rotary_positions()
         self.rotary_header = self.metadata.rotary_header()
         self.rotary_context = self.metadata.context()
+        torch._dynamo.mark_dynamic(self.rotary_positions, 0, min=1, max=4096)
 
     def _forward(self, q, k, v, layer, forward_batch, save_kv_cache, kwargs):
         if self.metadata is None or forward_batch is not self.forward_batch:
