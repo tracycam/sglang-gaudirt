@@ -51,6 +51,7 @@ python tests/acceptance/verify_process_audit.py "$ARTIFACTS/process-audit.json" 
 
 The plain measurement uses pretokenized `Engine.generate` inputs and excludes
 tokenization and HTTP. Its process-isolation audit runs at process entry and
-exit; no per-step state audit or profiler is enabled during timing. The CPU
+exit; no per-step state audit or profiler is enabled during timing. Each prompt
+is warmed for the complete output length before its measured request. The CPU
 fault test for the state audit runs with
 `python tests/acceptance/test_phase5a_state_audit.py`.

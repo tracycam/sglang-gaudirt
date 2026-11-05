@@ -115,10 +115,10 @@ def main():
         for length in bench_lengths:
             prompt = ids(length)
             warmup_stream = engine.generate(input_ids=prompt, sampling_params={
-                "temperature": 0, "max_new_tokens": 2, "ignore_eos": True,
+                "temperature": 0, "max_new_tokens": bench_output, "ignore_eos": True,
             }, stream=True)
             warmup = list(warmup_stream)
-            assert len(warmup[-1]["output_ids"]) == 2
+            assert len(warmup[-1]["output_ids"]) == bench_output
             before_timed = measurement(engine)
             start = time.perf_counter()
             first_at = last_at = None
