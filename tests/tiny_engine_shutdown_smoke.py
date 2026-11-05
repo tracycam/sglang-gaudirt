@@ -10,7 +10,23 @@ assert os.environ.get("SGLANG_PLATFORM") == "gaudirt"
 assert "habana_frameworks" not in sys.modules
 
 import torch
+import sglang
+import gaudirt.compiler as compiler
 from safetensors.torch import save_file
+
+original_backend = compiler.gaudirt_backend
+captures = 0
+
+
+def single_capture(graph, inputs):
+    global captures
+    captures += 1
+    if captures != 1:
+        raise AssertionError("model forward captured more than once")
+    return original_backend(graph, inputs)
+
+
+compiler.gaudirt_backend = single_capture
 
 
 def prepare(path):
@@ -65,12 +81,13 @@ def main():
         disable_overlap_schedule=True, chunked_prefill_size=-1, log_level="info",
     )
     try:
-        result = engine.generate(
-            input_ids=list(range(3, 22)),
-            sampling_params=dict(temperature=0, max_new_tokens=3, ignore_eos=True),
-        )
-        assert len(result["output_ids"]) == 3, result
-        print("Tiny SGLang prefill and decode passed", result["output_ids"], flush=True)
+        for rows in (1, 19, 137):
+            result = engine.generate(
+                input_ids=[3 + i % 125 for i in range(rows)],
+                sampling_params=dict(temperature=0, max_new_tokens=3, ignore_eos=True),
+            )
+            assert len(result["output_ids"]) == 3, result
+            print("Tiny SGLang dynamic prompt passed", rows, result["output_ids"], flush=True)
     finally:
         watchdog = engine.tokenizer_manager._subprocess_watchdog
         workers = list(zip(watchdog._names, watchdog._processes))

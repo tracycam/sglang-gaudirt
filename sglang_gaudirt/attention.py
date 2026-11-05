@@ -102,3 +102,6 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
 
     def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
         return self._forward(q, k, v, layer, forward_batch, save_kv_cache, kwargs)
+
+    def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
+        return self._forward(q, k, v, layer, forward_batch, save_kv_cache, kwargs)
