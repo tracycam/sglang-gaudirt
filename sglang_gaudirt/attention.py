@@ -27,10 +27,14 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         self.rotary_positions = None
         self.rotary_header = None
         self.rotary_context = None
+        self.row_locations = None
+        self.row_requests = None
+        self.request_mapping = None
 
     def init_forward_metadata(self, forward_batch):
         self.metadata = self.forward_batch = self.positions = None
         self.rotary_positions = self.rotary_header = self.rotary_context = None
+        self.row_locations = self.row_requests = self.request_mapping = None
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             prefixes = forward_batch.extend_prefix_lens_cpu
             lengths = forward_batch.extend_seq_lens_cpu
@@ -62,7 +66,11 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         self.rotary_positions = self.metadata.rotary_positions()
         self.rotary_header = self.metadata.rotary_header()
         self.rotary_context = self.metadata.context()
-        torch._dynamo.mark_dynamic(self.rotary_positions, 0, min=1, max=4096)
+        self.row_locations = self.metadata.row_locations()
+        self.row_requests = self.metadata.row_requests()
+        self.request_mapping = self.metadata.request_mapping()
+        for tensor in (self.rotary_positions, self.row_locations, self.row_requests):
+            torch._dynamo.mark_dynamic(tensor, 0, min=1, max=4096)
 
     def _forward(self, q, k, v, layer, forward_batch, save_kv_cache, kwargs):
         if self.metadata is None or forward_batch is not self.forward_batch:
@@ -75,11 +83,12 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
                 layer.v_scale is not None):
             raise ValueError("GaudiRT attention supports unquantized causal full attention only")
         rows = q.shape[0]
-        return torch.ops.gaudirt.paged_attn.default(
+        return torch.ops.gaudirt._paged_attn_validated.default(
             q.reshape(rows, -1), k.reshape(rows, -1), v.reshape(rows, -1),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            self.metadata, layer.qk_head_dim, layer.scaling,
+            self.row_locations, self.row_requests, self.rotary_positions, self.request_mapping,
+            self.rotary_header, layer.qk_head_dim, layer.scaling,
         )
 
     def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
