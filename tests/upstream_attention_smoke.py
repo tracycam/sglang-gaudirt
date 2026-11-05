@@ -127,10 +127,13 @@ def main():
             backend.init_forward_metadata(batch)
             assert batch.input_ids.shape == (len(positions_cpu),)
             assert getattr(batch.input_ids, "_gaudirt_validated_vocab") == 32000
+            expected_last = torch.cumsum(torch.tensor(lengths), dim=0) - 1
+            assert torch.equal(backend.last_token_indices.cpu().long(), expected_last)
             q_cpu = torch.randn((len(positions_cpu), Q_WIDTH), dtype=torch.bfloat16)
             k_cpu = torch.randn((len(positions_cpu), KV_WIDTH), dtype=torch.bfloat16)
             v_cpu = torch.randn((len(positions_cpu), KV_WIDTH), dtype=torch.bfloat16)
             with forward_context(ForwardContext(backend)):
+                assert current_platform.get_last_token_indices() is backend.last_token_indices
                 q_rot, k_rot = rope(positions, q_cpu.to("gaudirt:0"), k_cpu.to("gaudirt:0"))
                 cache_cpu = rope.cos_sin_cache.cpu()
                 assert torch.equal(cache_cpu.view(torch.int16), initial_cache.view(torch.int16)), \

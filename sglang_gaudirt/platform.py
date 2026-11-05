@@ -33,6 +33,14 @@ class GaudiRTSRTPlatform(SRTPlatform):
     def attention_accepts_flat_kv(self):
         return True
 
+    def get_last_token_indices(self):
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        if backend.last_token_indices is None:
+            raise RuntimeError("GaudiRT attention metadata has no last-token indices")
+        return backend.last_token_indices
+
     def apply_server_args_defaults(self, server_args):
         if server_args.page_size not in (None, 1):
             raise ValueError("GaudiRT currently supports KV page size 1 only")

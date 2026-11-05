@@ -30,11 +30,13 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         self.row_locations = None
         self.row_requests = None
         self.request_mapping = None
+        self.last_token_indices = None
 
     def init_forward_metadata(self, forward_batch):
         self.metadata = self.forward_batch = self.positions = None
         self.rotary_positions = self.rotary_header = self.rotary_context = None
         self.row_locations = self.row_requests = self.request_mapping = None
+        self.last_token_indices = None
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             prefixes = forward_batch.extend_prefix_lens_cpu
             lengths = forward_batch.extend_seq_lens_cpu
@@ -60,6 +62,8 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
             self.vocabulary,
         )
         forward_batch.input_ids = gaudirt.validated_token_ids(self.metadata)
+        self.last_token_indices = gaudirt.validated_last_token_indices(self.metadata)
+        torch._dynamo.mark_static(self.last_token_indices, 0)
         torch._dynamo.mark_dynamic(forward_batch.input_ids, 0, min=1, max=4096)
         self.forward_batch = forward_batch
         self.positions = forward_batch.positions
