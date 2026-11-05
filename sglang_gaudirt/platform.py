@@ -62,6 +62,16 @@ class GaudiRTSRTPlatform(SRTPlatform):
         write_req_to_token_pool(pool, request_indices, prefix_lengths, extend_lengths, prefixes, locations)
         return True
 
+    def prepare_decode_positions(self, seq_lens_cpu, device):
+        from .positions import decode_positions
+
+        return decode_positions(seq_lens_cpu, device)
+
+    def prepare_extend_positions(self, prefix_lens_cpu, seq_lens_cpu, total, device):
+        from .positions import extend_positions
+
+        return extend_positions(prefix_lens_cpu, seq_lens_cpu, total, device)
+
     def get_device_total_memory(self, device_id=0):
         if device_id != 0:
             raise ValueError("GaudiRT supports device 0 only")
