@@ -5,8 +5,8 @@ import gaudirt
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from .kv_pool import GaudiRTMHATokenToKVPool
 
 
 class GaudiRTPagedAttnBackend(AttentionBackend):
@@ -14,8 +14,8 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         pool = self.token_to_kv_pool
-        if not isinstance(pool, MHATokenToKVPool) or pool.kv_cache_layout != "nhd":
-            raise ValueError("GaudiRT attention requires an NHD MHA KV pool")
+        if not isinstance(pool, GaudiRTMHATokenToKVPool):
+            raise ValueError("GaudiRT attention requires its head-major MHA KV pool")
         if pool.dtype != torch.bfloat16 or pool.v_head_dim != pool.head_dim:
             raise ValueError("GaudiRT attention requires matching BF16 K/V heads")
         self.vocabulary = model_runner.model_config.vocab_size

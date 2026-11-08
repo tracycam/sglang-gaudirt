@@ -135,9 +135,9 @@ class GaudiRTSRTPlatform(SRTPlatform):
         gaudirt.synchronize()
 
     def get_mha_kv_pool_cls(self):
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from .kv_pool import GaudiRTMHATokenToKVPool
 
-        return MHATokenToKVPool
+        return GaudiRTMHATokenToKVPool
 
     def get_paged_allocator_cls(self):
         from .allocator import GaudiRTTokenToKVPoolAllocator
