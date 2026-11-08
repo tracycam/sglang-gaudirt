@@ -245,6 +245,7 @@ def main():
                     tp_size=1, max_total_tokens=int(os.environ.get("GAUDIRT_MAX_TOTAL_TOKENS", "4608")),
                     max_running_requests=1, context_length=int(os.environ.get("GAUDIRT_CONTEXT_LENGTH", "4608")),
                     mem_fraction_static=float(os.environ.get("GAUDIRT_STATIC_FRACTION", "0.9")),
+                    model_loader_extra_config=os.environ.get("GAUDIRT_MODEL_LOADER_CONFIG", "{}"),
                     disable_cuda_graph=True, disable_radix_cache=True, disable_overlap_schedule=True,
                     chunked_prefill_size=-1, log_level="warning")
     results = []
