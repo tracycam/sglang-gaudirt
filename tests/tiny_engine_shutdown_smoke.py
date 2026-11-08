@@ -34,7 +34,7 @@ def prepare(path):
     config = dict(
         architectures=["LlamaForCausalLM"], model_type="llama",
         hidden_size=128, intermediate_size=256, num_attention_heads=2,
-        num_key_value_heads=1, head_dim=64, num_hidden_layers=2,
+        num_key_value_heads=2, head_dim=64, num_hidden_layers=2,
         vocab_size=128, max_position_embeddings=1024, rms_norm_eps=1e-6,
         hidden_act="silu", torch_dtype="bfloat16", tie_word_embeddings=False,
         bos_token_id=1, eos_token_id=2, pad_token_id=0,
@@ -56,8 +56,8 @@ def prepare(path):
         weights[name + "post_attention_layernorm.weight"] = torch.ones(128, dtype=torch.bfloat16)
         for suffix, shape in (
             ("self_attn.q_proj.weight", (128, 128)),
-            ("self_attn.k_proj.weight", (64, 128)),
-            ("self_attn.v_proj.weight", (64, 128)),
+            ("self_attn.k_proj.weight", (128, 128)),
+            ("self_attn.v_proj.weight", (128, 128)),
             ("self_attn.o_proj.weight", (128, 128)),
             ("mlp.gate_proj.weight", (256, 128)),
             ("mlp.up_proj.weight", (256, 128)),
