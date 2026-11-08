@@ -20,7 +20,31 @@ def audit_prepare(self, forward):
     compiled = original_prepare(self, forward)
 
     def execute(*args, **kwargs):
-        output = compiled(*args, **kwargs)
+        if os.environ.get("GAUDIRT_TRACE_CONFIG_PATCH") == "1":
+            import torch
+            import gaudirt.compiler as compiler
+
+            patch_code = type(torch._dynamo.config).patch.__code__
+            calls = [0, 0]
+            configs = (torch._dynamo.config, torch.fx.experimental._config)
+
+            def profile(frame, event, arg):
+                if event == "call" and frame.f_code is patch_code:
+                    caller = frame.f_back
+                    if caller and caller.f_globals.get("__name__") == compiler.__name__ and caller.f_code.co_name == "execute":
+                        for index, config in enumerate(configs):
+                            if frame.f_locals.get("self") is config:
+                                calls[index] += 1
+
+            previous = sys.getprofile()
+            sys.setprofile(profile)
+            try:
+                output = compiled(*args, **kwargs)
+            finally:
+                sys.setprofile(previous)
+            print("FEATURE_CONFIG_PATCH_CALLS", calls, flush=True)
+        else:
+            output = compiled(*args, **kwargs)
         stats = gaudirt.recipe_cache_stats()
         if os.environ.get("GAUDIRT_EXPECT_WARM") == "1":
             assert stats[1] == 0, stats
