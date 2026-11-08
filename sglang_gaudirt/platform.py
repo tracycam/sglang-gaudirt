@@ -74,6 +74,9 @@ class GaudiRTSRTPlatform(SRTPlatform):
             raise ValueError("GaudiRT RoPE requires a CPU BF16 lookup table")
         return cache.to("gaudirt:0", non_blocking=True)
 
+    def rope_cache_computation_device(self, cache_device):
+        return torch.device("cpu")
+
     def get_compile_backend(self, mode=None):
         if mode is not None:
             raise ValueError("GaudiRT does not support compilation modes")
