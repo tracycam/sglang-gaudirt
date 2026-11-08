@@ -72,35 +72,34 @@ def cosine_sine(position, theta, dimension, dtype):
 def rotate(value, heads, dimension, cosine, sine, dtype):
     value = value.reshape(heads, dimension)
     a, b = value.chunk(2, dim=-1)
-    ac, bs = rounded(a * cosine, dtype), rounded(b * sine, dtype)
-    bc, ass = rounded(b * cosine, dtype), rounded(a * sine, dtype)
-    return torch.cat((rounded(ac - bs, dtype), rounded(bc + ass, dtype)), dim=-1)
+    return torch.cat((a * cosine - b * sine, b * cosine + a * sine), dim=-1)
 
 
 def layer_step(x, weights, attention, geometry, dtype):
     heads, kv_heads, dimension, eps, scale, theta = geometry
     x = x.to(dtype)
-    norm = rounded(x * torch.rsqrt((x * x).mean(-1, keepdim=True) + eps) * weights["in_norm"], dtype)
-    query = rounded(norm @ weights["q"].t(), dtype)
-    key = rounded(norm @ weights["k"].t(), dtype)
-    value = rounded(norm @ weights["v"].t(), dtype).reshape(kv_heads, dimension)
+    norm = x * torch.rsqrt((x * x).mean(-1, keepdim=True) + eps) * weights["in_norm"]
+    query = norm @ weights["q"].t()
+    key = norm @ weights["k"].t()
+    value = (norm @ weights["v"].t()).reshape(kv_heads, dimension)
     cosine, sine = cosine_sine(attention["position"], theta, dimension, dtype)
     query = rotate(query, heads, dimension, cosine, sine, dtype)
-    key = rotate(key, kv_heads, dimension, cosine, sine, dtype)
+    # The KV pool is an external BF16 state boundary. All other layer
+    # arithmetic, including attention probabilities, stays in the reference dtype.
+    key = rounded(rotate(key, kv_heads, dimension, cosine, sine, dtype), dtype)
+    value = rounded(value, dtype)
     keys = torch.cat((attention["keys"][:-1].to(dtype), key.unsqueeze(0)))
     values = torch.cat((attention["values"][:-1].to(dtype), value.unsqueeze(0)))
     head_map = torch.arange(heads) // (heads // kv_heads)
     scores = torch.einsum("hd,thd->ht", query, keys[:, head_map]) * scale
-    attended = rounded(torch.einsum("ht,thd->hd", torch.softmax(scores, dim=-1),
-                                    values[:, head_map]), dtype).reshape(1, -1)
-    projected = rounded(attended @ weights["out"].t(), dtype)
-    residual = rounded(projected + x, dtype)
-    norm = rounded(residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + eps)
-                   * weights["post_norm"], dtype)
-    gate = rounded(norm @ weights["gate"].t(), dtype)
-    up = rounded(norm @ weights["up"].t(), dtype)
-    activated = rounded(rounded(gate / (1 + torch.exp(-gate)), dtype) * up, dtype)
-    down = rounded(activated @ weights["down"].t(), dtype)
+    attended = torch.einsum("ht,thd->hd", torch.softmax(scores, dim=-1), values[:, head_map]).reshape(1, -1)
+    projected = attended @ weights["out"].t()
+    residual = projected + x
+    norm = residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + eps) * weights["post_norm"]
+    gate = norm @ weights["gate"].t()
+    up = norm @ weights["up"].t()
+    activated = gate / (1 + torch.exp(-gate)) * up
+    down = activated @ weights["down"].t()
     return rounded(down + residual, dtype)
 
 
@@ -150,7 +149,7 @@ def main():
 
         def logits(x, dtype):
             gamma = weights.get("model.norm.weight").to(dtype)
-            normalized = rounded(x * torch.rsqrt((x * x).mean(-1, keepdim=True) + geometry[3]) * gamma, dtype)
+            normalized = x * torch.rsqrt((x * x).mean(-1, keepdim=True) + geometry[3]) * gamma
             return rounded(normalized @ weights.get("lm_head.weight").to(dtype).t(), dtype).double()
 
         truth_logits = logits(rolling64, torch.float64)

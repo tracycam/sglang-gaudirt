@@ -23,27 +23,26 @@ def project(value, weight, dtype, parts):
 def step(x, weights, attention, geometry, dtype, parts=1):
     heads, kv_heads, dimension, eps, scale, theta = geometry
     x = x.to(dtype)
-    norm = rounded(x * torch.rsqrt((x * x).mean(-1, keepdim=True) + eps) * weights["in_norm"], dtype)
-    query = rounded(project(norm, weights["q"], dtype, parts), dtype)
-    key = rounded(project(norm, weights["k"], dtype, parts), dtype)
-    value = rounded(project(norm, weights["v"], dtype, parts), dtype).reshape(kv_heads, dimension)
+    norm = x * torch.rsqrt((x * x).mean(-1, keepdim=True) + eps) * weights["in_norm"]
+    query = project(norm, weights["q"], dtype, parts)
+    key = project(norm, weights["k"], dtype, parts)
+    value = project(norm, weights["v"], dtype, parts).reshape(kv_heads, dimension)
     cosine, sine = cosine_sine(attention["position"], theta, dimension, dtype)
     query = rotate(query, heads, dimension, cosine, sine, dtype)
-    key = rotate(key, kv_heads, dimension, cosine, sine, dtype)
+    key = rounded(rotate(key, kv_heads, dimension, cosine, sine, dtype), dtype)
+    value = rounded(value, dtype)
     keys = torch.cat((attention["keys"][:-1].to(dtype), key.unsqueeze(0)))
     values = torch.cat((attention["values"][:-1].to(dtype), value.unsqueeze(0)))
     head_map = torch.arange(heads) // (heads // kv_heads)
     scores = torch.einsum("hd,thd->ht", query, keys[:, head_map]) * scale
-    attended = rounded(torch.einsum("ht,thd->hd", torch.softmax(scores, dim=-1),
-                                    values[:, head_map]), dtype).reshape(1, -1)
-    projected = rounded(project(attended, weights["out"], dtype, parts), dtype)
-    residual = rounded(projected + x, dtype)
-    norm = rounded(residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + eps)
-                   * weights["post_norm"], dtype)
-    gate = rounded(project(norm, weights["gate"], dtype, parts), dtype)
-    up = rounded(project(norm, weights["up"], dtype, parts), dtype)
-    activated = rounded(rounded(gate / (1 + torch.exp(-gate)), dtype) * up, dtype)
-    down = rounded(project(activated, weights["down"], dtype, parts), dtype)
+    attended = torch.einsum("ht,thd->hd", torch.softmax(scores, dim=-1), values[:, head_map]).reshape(1, -1)
+    projected = project(attended, weights["out"], dtype, parts)
+    residual = projected + x
+    norm = residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + eps) * weights["post_norm"]
+    gate = project(norm, weights["gate"], dtype, parts)
+    up = project(norm, weights["up"], dtype, parts)
+    activated = gate / (1 + torch.exp(-gate)) * up
+    down = project(activated, weights["down"], dtype, parts)
     return rounded(down + residual, dtype)
 
 
@@ -100,8 +99,7 @@ def main():
 
         def logits(value, dtype, parts=1):
             gamma = weights.get("model.norm.weight").to(dtype)
-            normalized = rounded(value * torch.rsqrt((value * value).mean(-1, keepdim=True) + geometry[3])
-                                 * gamma, dtype)
+            normalized = value * torch.rsqrt((value * value).mean(-1, keepdim=True) + geometry[3]) * gamma
             return rounded(project(normalized, weights.get("lm_head.weight").to(dtype), dtype, parts), dtype).double()
 
         truth_logits = logits(rolling64, torch.float64)

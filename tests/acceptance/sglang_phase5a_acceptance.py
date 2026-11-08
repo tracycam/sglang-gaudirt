@@ -57,7 +57,7 @@ def audit_backend(graph, inputs):
 
             def paged(*args, previous=previous, indexes=indexes):
                 output = previous(*args)
-                query, key, value, key_pool, value_pool, locations, requests, positions, mapping, _ = (
+                query, key, value, key_pool, value_pool, locations, requests, positions, _, _ = (
                     args[i] for i in indexes
                 )
                 key_cpu, value_cpu = key.cpu(), value.cpu()
@@ -65,6 +65,8 @@ def audit_backend(graph, inputs):
                 if state["active"]:
                     assert query.shape[0] == 1
                     position, request, location = int(positions.cpu()[0]), int(requests.cpu()[0]), int(locations.cpu()[0])
+                    from sglang.srt.model_executor.forward_context import get_attn_backend
+                    mapping = get_attn_backend().req_to_token_pool.req_to_token
                     slots = mapping.cpu()[request, :position + 1].long()
                     assert int(slots[-1]) == location
                     keys, values = key_pool.cpu()[slots].clone(), value_pool.cpu()[slots].clone()
@@ -170,7 +172,7 @@ def audit_prepare(self, forward):
         if step <= 3:
             assert rows == (prefix_length if step == 1 else 1 if step == 2 else prefix_length + 1)
             request = int(backend.row_requests.cpu()[-1])
-            slots = backend.request_mapping.cpu()[request, :prefix_length].long()
+            slots = backend.req_to_token_pool.req_to_token.cpu()[request, :prefix_length].long()
             current = [buffer[slots].clone() for buffer in buffers]
             if step == 1:
                 fixed_prefix = current
