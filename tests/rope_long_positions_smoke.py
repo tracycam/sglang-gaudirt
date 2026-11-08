@@ -16,16 +16,17 @@ def main():
     assert support.GEOMETRY == "nanbeige"
     current_platform.init_backend()
     from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
     from sglang.srt.runtime_context import get_context
     from sglang_gaudirt.attention import GaudiRTPagedAttnBackend
+    from sglang_gaudirt.kv_pool import GaudiRTMHATokenToKVPool
 
     get_context().set_server_args(SimpleNamespace(rl_on_policy_target=None))
     req_pool = ReqToTokenPool(support.REQUESTS, support.CONTEXT, "gaudirt:0", False)
-    pool = MHATokenToKVPool(support.REQUESTS * support.CONTEXT, 1, torch.bfloat16,
-                            support.KV_HEADS, support.DIM, 1, "gaudirt:0", False)
+    pool = GaudiRTMHATokenToKVPool(support.REQUESTS * support.CONTEXT, 1, torch.bfloat16,
+                                   support.KV_HEADS, support.DIM, 1, "gaudirt:0", False)
     mapping = torch.zeros((support.REQUESTS + 1, support.CONTEXT), dtype=torch.int32)
     mapping[1:] = torch.arange(1, support.SLOTS, dtype=torch.int32).reshape(
         support.REQUESTS, support.CONTEXT
@@ -48,7 +49,8 @@ def main():
         positions=positions, extend_prefix_lens_cpu=prefixes, extend_seq_lens_cpu=lengths,
     )
     backend = GaudiRTPagedAttnBackend(SimpleNamespace(
-        req_to_token_pool=req_pool, token_to_kv_pool=pool, model_config=SimpleNamespace(vocab_size=32000)
+        req_to_token_pool=req_pool, token_to_kv_pool=pool, ps=SimpleNamespace(tp_size=1),
+        model_config=SimpleNamespace(vocab_size=32000, num_attention_heads=support.HEADS)
     ))
     backend.init_forward_metadata(batch)
     rope = RotaryEmbedding(support.DIM, support.DIM, support.CONTEXT, 10000, True, torch.bfloat16)

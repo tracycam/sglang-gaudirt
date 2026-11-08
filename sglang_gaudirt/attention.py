@@ -18,6 +18,11 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
             raise ValueError("GaudiRT attention requires its head-major MHA KV pool")
         if pool.dtype != torch.bfloat16 or pool.v_head_dim != pool.head_dim:
             raise ValueError("GaudiRT attention requires matching BF16 K/V heads")
+        if model_runner.ps.tp_size != 1:
+            raise ValueError("GaudiRT attention currently supports tensor parallel size 1")
+        self.query_heads = model_runner.model_config.num_attention_heads
+        if self.query_heads % pool.head_num:
+            raise ValueError("GaudiRT attention requires an integral GQA head ratio")
         self.vocabulary = model_runner.model_config.vocab_size
         if not isinstance(self.vocabulary, int) or self.vocabulary <= 0:
             raise ValueError("GaudiRT attention requires a positive model vocabulary")
@@ -29,13 +34,13 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         self.rotary_context = None
         self.row_locations = None
         self.row_requests = None
-        self.request_mapping = None
+        self.attention_plan = None
         self.last_token_indices = None
 
     def init_forward_metadata(self, forward_batch):
         self.metadata = self.forward_batch = self.positions = None
         self.rotary_positions = self.rotary_header = self.rotary_context = None
-        self.row_locations = self.row_requests = self.request_mapping = None
+        self.row_locations = self.row_requests = self.attention_plan = None
         self.last_token_indices = None
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             prefixes = forward_batch.extend_prefix_lens_cpu
@@ -72,7 +77,8 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         self.rotary_context = self.metadata.context()
         self.row_locations = self.metadata.row_locations()
         self.row_requests = self.metadata.row_requests()
-        self.request_mapping = self.metadata.request_mapping()
+        self.attention_plan = self.metadata.attention_plan(self.query_heads, pool.head_num, pool.head_dim)
+        torch._dynamo.mark_dynamic(self.attention_plan, 0, min=1, max=536870912)
         for tensor in (self.rotary_positions, self.row_locations, self.row_requests):
             torch._dynamo.mark_dynamic(tensor, 0, min=1, max=4096)
 
@@ -93,7 +99,7 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
             v if v.ndim == 2 else v.reshape(rows, -1),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            self.row_locations, self.row_requests, self.rotary_positions, self.request_mapping,
+            self.row_locations, self.row_requests, self.rotary_positions, self.attention_plan,
             self.rotary_header, layer.qk_head_dim, layer.scaling,
         )
 

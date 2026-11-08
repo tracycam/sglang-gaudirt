@@ -53,21 +53,23 @@ def main():
     from sglang.srt.layers.layernorm import RMSNorm
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
     from sglang.srt.runtime_context import get_context
     from sglang_gaudirt.attention import GaudiRTPagedAttnBackend
+    from sglang_gaudirt.kv_pool import GaudiRTMHATokenToKVPool
 
     get_context().set_server_args(SimpleNamespace(rl_on_policy_target=None))
     req_pool = ReqToTokenPool(REQUESTS, CONTEXT, "gaudirt:0", False)
-    pool = MHATokenToKVPool(REQUESTS * CONTEXT, 1, torch.bfloat16, KV_HEADS, DIM,
-                            2, "gaudirt:0", False)
+    pool = GaudiRTMHATokenToKVPool(REQUESTS * CONTEXT, 1, torch.bfloat16, KV_HEADS, DIM,
+                                   2, "gaudirt:0", False)
     mapping = torch.zeros((REQUESTS + 1, CONTEXT), dtype=torch.int32)
     mapping[1:] = torch.arange(1, SLOTS, dtype=torch.int32).reshape(REQUESTS, CONTEXT)
     req_pool.req_to_token.copy_(mapping)
     runner = SimpleNamespace(req_to_token_pool=req_pool, token_to_kv_pool=pool,
-                             model_config=SimpleNamespace(vocab_size=32000))
+                             ps=SimpleNamespace(tp_size=1),
+                             model_config=SimpleNamespace(vocab_size=32000, num_attention_heads=HEADS))
     backend = GaudiRTPagedAttnBackend(runner)
     layers = [RadixAttention(HEADS, DIM, SCALE, KV_HEADS, layer_id=i) for i in range(2)]
     rope = RotaryEmbedding(DIM, DIM, CONTEXT, 10000, True, torch.bfloat16)
