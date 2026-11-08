@@ -10,6 +10,13 @@ import torch
 from layer_fp64_audit import Weights, cosine_sine, rotate, rounded
 
 
+def assess_conditioned_kl(candidate, cpu_trees):
+    if not cpu_trees or not all(math.isfinite(value) for value in (candidate, *cpu_trees.values())):
+        raise ValueError("conditioned KL requires finite candidate and CPU references")
+    return {"max_kl": candidate, "candidate_m1_kl": candidate, "cpu_tree_kl": cpu_trees,
+            "ref_floor": max(cpu_trees.values()), "kl_limit": 0.01, "kl_pass": candidate <= 0.01}
+
+
 def project(value, weight, dtype, parts):
     if dtype == torch.float64 or parts == 1:
         return value @ weight.t()
@@ -115,9 +122,9 @@ def main():
 
         kl = divergence(candidate)
         tree_kl = {str(parts): divergence(value) for parts, value in cpu_logits.items()}
-        # The capture is the validated M=1 replay of this same online prefix;
-        # the acceptance run independently compares its logits with M=137.
-        floor_kl = max(kl, *tree_kl.values())
+        # This capture is itself the M=1 candidate. Its own KL cannot be
+        # used to raise its acceptance floor. The Nanbeige acceptance uses
+        # the stricter absolute 0.01 bound even when a CPU tree differs more.
         top = torch.topk(truth_logits, 2, dim=-1)
         first = top.values[..., 0].to(torch.bfloat16)
         spacing = (torch.nextafter(first, torch.full_like(first, float("inf"))).float() - first.float()).abs().double()
@@ -125,14 +132,13 @@ def main():
         selected = candidate.argmax(-1)
         top1 = selected == top.indices[..., 0]
         top2 = (selected.unsqueeze(-1) == top.indices).any(-1)
-        result.update(max_kl=kl, validated_m1_kl=kl, cpu_tree_kl=tree_kl, ref_floor=floor_kl,
-                      kl_limit=max(0.01, 1.15 * floor_kl),
+        result.update(**assess_conditioned_kl(kl, tree_kl),
                       top1_match_non_tied=bool(top1[~tied].all()) if (~tied).any() else None,
                       top2_match_tied=bool(top2[tied].all()) if tied.any() else None,
                       tied_samples=tied.sum().item())
         if path := os.environ.get("GAUDIRT_LAYER_RECEIPT"):
             Path(path).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-        assert kl <= result["kl_limit"] and torch.where(tied, top2, top1).all(), result
+        assert result["kl_pass"] and torch.where(tied, top2, top1).all(), result
         print("MULTITREE_CONDITIONED_AUDIT", json.dumps(result, sort_keys=True), flush=True)
     finally:
         weights.close()

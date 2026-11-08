@@ -174,10 +174,10 @@ def main():
         top2 = (selected.unsqueeze(-1) == top.indices).any(-1)
         top1_match = bool(top1[~tied].all()) if (~tied).any() else None
         top2_match = bool(top2[tied].all()) if tied.any() else None
-        assert kl <= max(0.01, 1.15 * floor_kl), (kl, floor_kl)
+        assert kl <= 0.01, (kl, floor_kl)
         assert torch.where(tied, top2, top1).all(), (tied.tolist(), selected.tolist(), top.indices.tolist())
         result = {"layers": layers, "max_row_relative_l2": max(item["relative_l2"] for item in layers),
-                  "max_kl": kl, "ref_floor": floor_kl, "kl_limit": max(0.01, 1.15 * floor_kl),
+                  "max_kl": kl, "ref_floor": floor_kl, "kl_limit": 0.01,
                   "top1_match_non_tied": top1_match, "top2_match_tied": top2_match,
                   "tied_samples": tied.sum().item()}
         print("LAYER_AND_CONDITIONED_AUDIT", json.dumps(result, sort_keys=True), flush=True)

@@ -43,6 +43,16 @@ def main():
     assert torch.isfinite(actual).all() and torch.equal(actual, actual.to(torch.bfloat16).float())
     tree = multitree.step(x, weights, attention, geometry, torch.float32, 1)
     assert torch.equal(actual, tree)
+    rejected = multitree.assess_conditioned_kl(0.02, {"1": 0.001, "2": 0.002})
+    assert rejected["ref_floor"] == 0.002 and not rejected["kl_pass"]
+    assert not multitree.assess_conditioned_kl(0.02, {"1": 0.1})["kl_pass"]
+    assert multitree.assess_conditioned_kl(0.009, {"1": 0.001})["kl_pass"]
+    try:
+        multitree.assess_conditioned_kl(float("nan"), {"1": 0.001})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("nonfinite conditioned KL accepted")
     print("FP32 layer reference rounds only the external KV and layer outputs", flush=True)
 
 
