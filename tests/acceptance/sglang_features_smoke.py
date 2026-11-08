@@ -18,8 +18,21 @@ original_prepare = GaudiRTSRTPlatform.prepare_model_forward
 
 def audit_prepare(self, forward):
     compiled = original_prepare(self, forward)
+    event_counts = None
+    previous_events = None
+    event_steps = 0
+    if os.environ.get("GAUDIRT_TRACE_EVENTS") == "1":
+        import ctypes
+
+        probe = ctypes.CDLL(None)
+        create = probe.gaudirt_test_event_create_count
+        destroy = probe.gaudirt_test_event_destroy_count
+        create.restype = destroy.restype = ctypes.c_uint64
+        event_counts = lambda: (create(), destroy())
 
     def execute(*args, **kwargs):
+        nonlocal previous_events, event_steps
+        before_events = event_counts() if event_counts else None
         if os.environ.get("GAUDIRT_TRACE_CONFIG_PATCH") == "1":
             import torch
             import gaudirt.compiler as compiler
@@ -45,6 +58,17 @@ def audit_prepare(self, forward):
             print("FEATURE_CONFIG_PATCH_CALLS", calls, flush=True)
         else:
             output = compiled(*args, **kwargs)
+        if event_counts:
+            after_events = event_counts()
+            between = None if previous_events is None else [a - b for a, b in zip(before_events, previous_events)]
+            forward = [a - b for a, b in zip(after_events, before_events)]
+            if os.environ.get("GAUDIRT_EXPECT_STABLE_EVENTS") == "1" and event_steps >= 2:
+                assert between == [0, 0] and forward == [0, 0], (between, forward)
+            print("FEATURE_EVENT_DELTA", {"between_forwards": between,
+                                          "forward": forward},
+                  flush=True)
+            previous_events = after_events
+            event_steps += 1
         stats = gaudirt.recipe_cache_stats()
         if os.environ.get("GAUDIRT_EXPECT_WARM") == "1":
             assert stats[1] == 0, stats
