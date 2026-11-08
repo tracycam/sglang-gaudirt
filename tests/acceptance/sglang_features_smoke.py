@@ -1,7 +1,9 @@
 """Compare ordinary SGLang inference with chunking and prefix caching enabled."""
 
+import hashlib
 import json
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -11,7 +13,38 @@ assert "habana_frameworks" not in sys.modules
 
 import gaudirt
 import sglang
+import torch
 from sglang_gaudirt.platform import GaudiRTSRTPlatform
+
+feature_writes = []
+if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1":
+    import gaudirt.compiler as compiler
+
+    original_backend = compiler.gaudirt_backend
+
+    def audit_backend(graph, inputs):
+        compiled = original_backend(graph, inputs)
+        segments = list(compiled.__self__.named_children())
+        for index, (_, segment) in enumerate(segments):
+            if index % 2 != 1:
+                continue
+            nodes = tuple(segment.graph.nodes)
+            placeholders = [node for node in nodes if node.op == "placeholder"]
+            attention = [node for node in nodes if node.op == "call_function" and
+                         node.target == torch.ops.gaudirt._paged_attn_validated.default]
+            assert len(attention) == 1
+            key_index, value_index = [placeholders.index(node) for node in attention[0].args[1:3]]
+            previous = segment.forward
+
+            def paged(*args, previous=previous, key_index=key_index, value_index=value_index):
+                output = previous(*args)
+                feature_writes.append((args[key_index].cpu(), args[value_index].cpu()))
+                return output
+
+            segment.forward = paged
+        return compiled
+
+    compiler.gaudirt_backend = audit_backend
 
 original_prepare = GaudiRTSRTPlatform.prepare_model_forward
 
@@ -21,6 +54,27 @@ def audit_prepare(self, forward):
     event_counts = None
     previous_events = None
     event_steps = 0
+    previous_kv = None
+    audit_steps = 0
+    audit_mode = os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1"
+    if audit_mode:
+        from phase5a_state_audit import check_kv_step
+
+        mode = os.environ["GAUDIRT_AUDIT_MODE"]
+        assert mode in ("cold", "warm")
+        trace = open(os.environ["GAUDIRT_TRACE_PATH"], "wb" if mode == "cold" else "rb")
+        digest = hashlib.sha256()
+
+        def emit(tensor):
+            raw = tensor.contiguous().view(torch.uint8).numpy().tobytes()
+            header = struct.pack("<Q", len(raw))
+            digest.update(header)
+            digest.update(raw)
+            if mode == "cold":
+                trace.write(header)
+                trace.write(raw)
+            else:
+                assert trace.read(len(header)) == header and trace.read(len(raw)) == raw, "cold/warm bytes differ"
     if os.environ.get("GAUDIRT_TRACE_EVENTS") == "1":
         import ctypes
 
@@ -31,10 +85,11 @@ def audit_prepare(self, forward):
         event_counts = lambda: (create(), destroy())
 
     def execute(*args, **kwargs):
-        nonlocal previous_events, event_steps
+        nonlocal previous_events, event_steps, previous_kv, audit_steps
         before_events = event_counts() if event_counts else None
+        if audit_mode:
+            feature_writes.clear()
         if os.environ.get("GAUDIRT_TRACE_CONFIG_PATCH") == "1":
-            import torch
             import gaudirt.compiler as compiler
 
             patch_code = type(torch._dynamo.config).patch.__code__
@@ -58,6 +113,29 @@ def audit_prepare(self, forward):
             print("FEATURE_CONFIG_PATCH_CALLS", calls, flush=True)
         else:
             output = compiled(*args, **kwargs)
+        if audit_mode:
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            pool = get_attn_backend().token_to_kv_pool
+            locations = args[2].out_cache_loc.cpu().long()
+            buffers = [tensor.cpu() for layer in range(pool.start_layer, pool.start_layer + pool.layer_num)
+                       for tensor in (pool.get_key_buffer(layer), pool.get_value_buffer(layer))]
+            assert len(feature_writes) == pool.layer_num
+            previous_kv = check_kv_step(previous_kv, buffers, feature_writes, locations)
+            logits = output.next_token_logits.cpu()
+            assert torch.isfinite(logits).all()
+            for value in (locations, logits, *buffers):
+                emit(value)
+            audit_steps += 1
+            if audit_steps == 10:
+                if mode == "warm":
+                    assert not trace.read(1), "cold trace has extra records"
+                trace.close()
+                summary = {"mode": mode, "steps": audit_steps, "sha256": digest.hexdigest(),
+                           "cache": gaudirt.recipe_cache_stats()}
+                Path(os.environ["GAUDIRT_FEATURE_STATE_RECEIPT"]).write_text(
+                    json.dumps(summary, indent=2, sort_keys=True) + "\n")
+                print("FEATURE_STATE_AUDIT", json.dumps(summary), flush=True)
         if event_counts:
             after_events = event_counts()
             between = None if previous_events is None else [a - b for a, b in zip(before_events, previous_events)]
@@ -116,6 +194,11 @@ def main():
         if reference := os.environ.get("GAUDIRT_FEATURE_REFERENCE"):
             expected = json.loads(Path(reference).read_text())
             assert [item["tokens"] for item in output] == [item["tokens"] for item in expected], output
+        if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1":
+            summary = json.loads(Path(os.environ["GAUDIRT_FEATURE_STATE_RECEIPT"]).read_text())
+            assert summary["steps"] == 10
+            if os.environ["GAUDIRT_AUDIT_MODE"] == "warm":
+                assert summary["cache"][1] == 0, summary
         Path(os.environ["GAUDIRT_FEATURE_RECEIPT"]).write_text(json.dumps(output, indent=2) + "\n")
         print("FEATURE_OUTPUT", json.dumps(output), flush=True)
     finally:
