@@ -35,6 +35,15 @@ def main():
     expected[1, 5] = 23
     expected[3, 3] = 32
     assert torch.equal(pool.req_to_token.cpu(), expected)
+    last = current_platform.paged_decode_last_locations(pool, requests, torch.tensor([6, 4]))
+    assert last.cpu().tolist() == [23, 32]
+    for invalid in (torch.tensor([0, 4]), torch.tensor([6, 17])):
+        try:
+            current_platform.paged_decode_last_locations(pool, requests, invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid decode mapping accepted")
     try:
         current_platform.write_req_to_token_pool(pool, requests, starts, 1, None, locations)
     except ValueError:

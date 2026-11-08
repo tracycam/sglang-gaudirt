@@ -54,9 +54,10 @@ class GaudiRTSRTPlatform(SRTPlatform):
             "tokenizer_worker_num", "detokenizer_worker_num",
         )):
             raise ValueError("GaudiRT currently requires one device and one tokenizer/detokenizer worker")
-        if server_args.page_size not in (None, 1):
-            raise ValueError("GaudiRT currently supports KV page size 1 only")
-        server_args.page_size = 1
+        if server_args.page_size not in (None, 1, 16, 64):
+            raise ValueError("GaudiRT supports KV page sizes 1, 16, and 64")
+        if server_args.page_size is None:
+            server_args.page_size = 1
         server_args.disable_cuda_graph = True
 
     @contextmanager
@@ -100,6 +101,11 @@ class GaudiRTSRTPlatform(SRTPlatform):
 
         write_req_to_token_pool(pool, request_indices, prefix_lengths, extend_lengths, prefixes, locations)
         return True
+
+    def paged_decode_last_locations(self, pool, request_indices, sequence_lengths):
+        from .req_to_token import read_decode_last_locations
+
+        return read_decode_last_locations(pool, request_indices, sequence_lengths)
 
     def prepare_decode_positions(self, seq_lens_cpu, device):
         from .positions import decode_positions

@@ -3,6 +3,25 @@
 import torch
 
 
+def read_decode_last_locations(pool, request_indices, sequence_lengths):
+    table = pool.req_to_token
+    vectors = (request_indices, sequence_lengths)
+    if (table.device.type != "gaudirt" or table.dtype != torch.int32 or table.dim() != 2 or
+            not all(isinstance(x, torch.Tensor) and x.device.type == "cpu" and x.dim() == 1
+                    and x.dtype in (torch.int32, torch.int64) for x in vectors)):
+        raise ValueError("GaudiRT decode mapping requires a device table and host metadata")
+    requests, lengths = request_indices.tolist(), sequence_lengths.tolist()
+    if (not requests or len(requests) != len(lengths) or any(
+        request < 0 or request >= table.size(0) or length <= 0 or length > table.size(1)
+        for request, length in zip(requests, lengths)
+    )):
+        raise ValueError("GaudiRT decode mapping metadata is out of range")
+    result = torch.empty(len(requests), dtype=torch.int32, device=table.device)
+    for index, (request, length) in enumerate(zip(requests, lengths)):
+        result[index:index + 1].copy_(table[request, length - 1:length], non_blocking=True)
+    return result
+
+
 def write_req_to_token_pool(pool, request_indices, prefix_lengths, extend_lengths, prefixes, locations):
     table = pool.req_to_token
     host_vectors = (request_indices, prefix_lengths)
