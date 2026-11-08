@@ -28,7 +28,7 @@ def reference(x, residual, gamma, up, down, fp64):
     residual = rounded(x + residual)
     x = rounded(residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + EPS) * gamma)
     gate, up_result = rounded(x @ up.t()).chunk(2, dim=-1)
-    x = rounded(rounded(gate / (1 + torch.exp(-gate))) * up_result)
+    x = rounded((gate / (1 + torch.exp(-gate))) * up_result)
     return rounded(x @ down.t()).double(), residual.double()
 
 

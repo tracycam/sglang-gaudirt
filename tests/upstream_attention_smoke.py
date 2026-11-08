@@ -13,6 +13,7 @@ assert "habana_frameworks" not in sys.modules
 import torch
 from fp64_reference import direct_bf16
 import paged_attention_smoke as attention_ref
+from paged_attention_reference import isolated_errors, tiled_bf16_pv
 import rotary_runtime_smoke as rotary_ref
 import gaudirt
 from sglang.srt.platforms import current_platform
@@ -87,8 +88,8 @@ def main():
 
     packed_cpu = torch.randn((7, 2 * DIM), dtype=torch.bfloat16)
     gate, up = packed_cpu.double().chunk(2, dim=-1)
-    act_truth = direct_bf16(direct_bf16(gate / (1 + torch.exp(-gate))) * up)
-    act_floor = ((gate.float() / (1 + torch.exp(-gate.float()))).to(torch.bfloat16).float()
+    act_truth = direct_bf16((gate / (1 + torch.exp(-gate))) * up)
+    act_floor = ((gate.float() / (1 + torch.exp(-gate.float())))
                  * up.float()).to(torch.bfloat16).double()
     stats = check(silu(packed_cpu.to("gaudirt:0")), act_truth, act_floor)
     errors.append(stats[0]); floors.append(stats[1]); absolutes.append(stats[2])
@@ -163,7 +164,20 @@ def main():
                     assert torch.equal(actual_v.view(torch.int16), expected_v.view(torch.int16))
                     r64 = attention_ref.expected(q_rot_cpu, expected_k, expected_v, row_requests, positions_cpu, mapping, True)
                     r32 = attention_ref.expected(q_rot_cpu, expected_k, expected_v, row_requests, positions_cpu, mapping, False)
-                    stats = check(output, r64, r32)
+                    # These cases have at most 512 visible keys per request;
+                    # the isolated attention gate uses the same single-tile
+                    # BF16-PV arithmetic as the device, independently of the
+                    # pure FP32 reference for full decoder layers.
+                    pv = tiled_bf16_pv(q_rot_cpu, expected_k, expected_v, row_requests,
+                                       positions_cpu, mapping, HEADS, KV_HEADS, DIM,
+                                       attention_ref.SCALE_FP32, 512)
+                    output_cpu = output.cpu().double()
+                    error, pv_error = isolated_errors(output_cpu, r64, pv)
+                    denom = torch.linalg.vector_norm(r64, dim=-1).clamp_min(1e-30)
+                    floor = (torch.linalg.vector_norm(r32 - r64, dim=-1) / denom).max().item()
+                    assert torch.isfinite(r32).all()
+                    stats = (error, floor, (output_cpu - r64).abs().max().item())
+                    print("isolated attention BF16-PV error", pv_error, flush=True)
                     errors.append(stats[0]); floors.append(stats[1]); absolutes.append(stats[2])
                     payload.extend(output.cpu().view(torch.int16).numpy().tobytes())
                     payload.extend(actual_k.view(torch.int16).numpy().tobytes())
