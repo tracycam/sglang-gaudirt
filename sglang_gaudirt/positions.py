@@ -14,7 +14,8 @@ def decode_positions(seq_lens_cpu, device):
     lengths = seq_lens_cpu.tolist()
     if not lengths or len(lengths) > 4096 or any(length <= 0 for length in lengths):
         raise ValueError("GaudiRT decode sequence lengths are out of range")
-    return _device_vector([length - 1 for length in lengths], torch.int64, device)
+    # Decode metadata transfers this host vector together with the attention plan.
+    return torch.tensor([length - 1 for length in lengths], dtype=torch.int64, device="cpu")
 
 
 def extend_positions(prefix_lens_cpu, seq_lens_cpu, total, device):

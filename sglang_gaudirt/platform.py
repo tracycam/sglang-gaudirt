@@ -110,6 +110,9 @@ class GaudiRTSRTPlatform(SRTPlatform):
 
         return decode_positions(seq_lens_cpu, device)
 
+    def defer_eager_decode_positions(self) -> bool:
+        return True
+
     def prepare_extend_positions(self, prefix_lens_cpu, seq_lens_cpu, total, device):
         from .positions import extend_positions
 

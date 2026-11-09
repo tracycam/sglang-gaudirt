@@ -50,22 +50,23 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         elif forward_batch.forward_mode == ForwardMode.DECODE:
             if forward_batch.seq_lens_cpu is None or forward_batch.seq_lens_cpu.device.type != "cpu":
                 raise ValueError("GaudiRT attention requires host decode sequence lengths")
-            prefixes = [length - 1 for length in forward_batch.seq_lens_cpu.tolist()]
+            if forward_batch.positions.device.type != "cpu" or forward_batch.positions.dtype != torch.int64:
+                raise ValueError("GaudiRT attention requires host decode positions before metadata preparation")
+            prefixes = forward_batch.positions.tolist()
             lengths = [1] * len(prefixes)
         else:
             raise ValueError("GaudiRT attention supports extend and decode only")
         pool = self.token_to_kv_pool
-        self.metadata = torch.classes.gaudirt.PagedMetadata._from_scheduler(
-            forward_batch.out_cache_loc,
-            forward_batch.req_pool_indices,
-            forward_batch.positions,
-            self.req_to_token_pool.req_to_token,
-            prefixes,
-            lengths,
-            pool.get_key_buffer(pool.start_layer).size(0),
-            forward_batch.input_ids,
-            self.vocabulary,
-        )
+        arguments = (forward_batch.out_cache_loc, forward_batch.req_pool_indices, forward_batch.positions,
+                     self.req_to_token_pool.req_to_token, prefixes, lengths,
+                     pool.get_key_buffer(pool.start_layer).size(0), forward_batch.input_ids, self.vocabulary)
+        if forward_batch.forward_mode == ForwardMode.DECODE:
+            self.metadata = torch.classes.gaudirt.PagedMetadata._from_scheduler_fused(
+                *arguments, self.query_heads, pool.head_num, pool.head_dim
+            )
+            forward_batch.positions = self.metadata.model_positions()
+        else:
+            self.metadata = torch.classes.gaudirt.PagedMetadata._from_scheduler(*arguments)
         (tokens, self.last_token_indices, self.rotary_positions, self.rotary_header,
          self.row_locations, self.row_requests, self.attention_plan, self.rotary_context) = \
             self.metadata.forward_tensors(self.query_heads, pool.head_num, pool.head_dim)
