@@ -99,3 +99,10 @@ last row of the 1024+137 chunked replay byte for byte. Run this separately from
 the full-pool trace. Unchunked versus chunked uses different arithmetic trees;
 its validation is the per-layer reference and conditioned KL gate, not a
 greedy-token equality assertion.
+
+To capture the chunked replay for the per-layer reference, run the main state
+audit with `GAUDIRT_FIXED_PREFIX_LENGTH=1160`, `GAUDIRT_AUDIT_CHUNK_SIZE=1024`,
+`GAUDIRT_PROMPTS=''` and `GAUDIRT_DECODE_STEPS=0`. The audit compares the
+replayed last-row inputs and attention output at every layer to M=1. Run the
+FP64 audit on its capture with `GAUDIRT_AUDIT_PV_TILE=512`; the primary FP32
+reference still keeps attention probabilities in FP32.
