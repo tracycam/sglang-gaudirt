@@ -111,6 +111,17 @@ def main():
             print("AUDIT_OFF_MATCH", length, len(result["output_ids"]), flush=True)
         warm = measurement(engine)
         assert warm["recipe_cache"][1] == 0, warm
+        if feature_reference := os.environ.get("GAUDIRT_FEATURE_REFERENCE_OUT"):
+            from phase5a_feature_prompts import feature_prompts
+
+            features = [engine.generate(input_ids=prompt, sampling_params={
+                "temperature": 0, "max_new_tokens": 4, "ignore_eos": True,
+            }) for prompt in feature_prompts(vocabulary)]
+            feature_results = [{"tokens": item["output_ids"],
+                                "cached_tokens": item["meta_info"]["cached_tokens"]} for item in features]
+            assert all(len(item["tokens"]) == 4 and item["cached_tokens"] == 0 for item in feature_results)
+            Path(feature_reference).write_text(json.dumps(feature_results, indent=2) + "\n")
+            print("PLAIN_FEATURE_OUTPUT", json.dumps(feature_results), flush=True)
         timings = []
         for length in bench_lengths:
             prompt = ids(length)

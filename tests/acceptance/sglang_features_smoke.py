@@ -15,6 +15,7 @@ import gaudirt
 import sglang
 import torch
 from sglang_gaudirt.platform import GaudiRTSRTPlatform
+from phase5a_feature_prompts import feature_prompts
 
 feature_writes = []
 if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1":
@@ -164,20 +165,20 @@ def main():
 
     model = Path(os.environ["GAUDIRT_TARGET_MODEL"])
     config = json.loads((model / "config.json").read_text())
-    assert config["num_hidden_layers"] == 2
+    assert config["num_hidden_layers"] == int(os.environ.get("GAUDIRT_EXPECT_LAYERS", "2"))
     enabled = os.environ["GAUDIRT_FEATURE_MODE"] == "enabled"
     assert enabled or os.environ["GAUDIRT_FEATURE_MODE"] == "plain"
     page_size = int(os.environ.get("GAUDIRT_TEST_PAGE_SIZE", "1"))
     vocabulary = config["vocab_size"]
-    prefix = [3 + (i * 37) % (vocabulary - 3) for i in range(160)]
-    prompts = [prefix + [3 + (j * 11 + i) % (vocabulary - 3) for i in range(9)]
-               for j in (1, 2)]
+    prompts = feature_prompts(vocabulary)
     engine = Engine(
         model_path=str(model), skip_tokenizer_init=True, device="gaudirt", dtype="bfloat16",
-        tp_size=1, max_total_tokens=1024, max_running_requests=1, context_length=1024,
+        tp_size=1, max_total_tokens=int(os.environ.get("GAUDIRT_FEATURE_MAX_TOKENS", "1024")),
+        max_running_requests=1, context_length=int(os.environ.get("GAUDIRT_FEATURE_CONTEXT", "1024")),
         mem_fraction_static=0.9, model_loader_extra_config='{"enable_multithread_load":false}',
         page_size=page_size, disable_cuda_graph=True, disable_radix_cache=not enabled,
-        disable_overlap_schedule=True, chunked_prefill_size=64 if enabled else -1,
+        disable_overlap_schedule=True,
+        chunked_prefill_size=int(os.environ.get("GAUDIRT_FEATURE_CHUNK_SIZE", "64")) if enabled else -1,
         log_level="warning",
     )
     try:
@@ -188,7 +189,7 @@ def main():
                    "cached_tokens": result["meta_info"]["cached_tokens"]} for result in results]
         assert all(len(item["tokens"]) == 4 for item in output), output
         if enabled:
-            assert output[1]["cached_tokens"] >= 128, output
+            assert output[1]["cached_tokens"] >= int(os.environ.get("GAUDIRT_FEATURE_MIN_CACHED", "128")), output
         else:
             assert output[1]["cached_tokens"] == 0, output
         if reference := os.environ.get("GAUDIRT_FEATURE_REFERENCE"):
