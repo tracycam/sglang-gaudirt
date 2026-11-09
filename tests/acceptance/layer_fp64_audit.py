@@ -118,8 +118,8 @@ def layer_step(x, weights, attention, geometry, dtype, same_boundary=False, proj
     return rounded(down + residual, dtype)
 
 
-def frozen_layer_metrics(layer, actual, pure64, boundary64, boundary32, bf16_pv64=None):
-    values = (actual, pure64, boundary64, boundary32) + (() if bf16_pv64 is None else (bf16_pv64,))
+def frozen_layer_metrics(layer, actual, pure64, boundary64, boundary32, bf16_pv64):
+    values = (actual, pure64, boundary64, boundary32, bf16_pv64)
     assert all(torch.isfinite(value).all() for value in values)
 
     def relative(value, reference):
@@ -127,20 +127,23 @@ def frozen_layer_metrics(layer, actual, pure64, boundary64, boundary32, bf16_pv6
         return (torch.linalg.vector_norm(value - reference) / denominator).item()
 
     error_pure = relative(actual, pure64)
-    error_boundary = relative(actual, boundary64)
+    error_fp64_probability = relative(actual, boundary64)
+    error_boundary = relative(actual, bf16_pv64)
     boundary_vs_pure = relative(boundary32, pure64)
     arithmetic_difference = relative(boundary32, boundary64)
     limit = max(3e-3, 2 * boundary_vs_pure)
     result = {"layer": layer, "relative_l2_pure": error_pure,
             "fp32_same_boundary_vs_fp64_pure": boundary_vs_pure,
             "relative_l2_same_boundary": error_boundary,
-            "fp32_vs_fp64_same_boundary": arithmetic_difference,
+            "fp32_vs_fp64_operator_boundary": arithmetic_difference,
             "max_abs_pure": (actual - pure64).abs().max().item(),
-            "max_abs_same_boundary": (actual - boundary64).abs().max().item(),
+            "max_abs_same_boundary": (actual - bf16_pv64).abs().max().item(),
+            "relative_l2_same_operators_fp64_probability": error_fp64_probability,
+            "max_abs_same_operators_fp64_probability": (actual - boundary64).abs().max().item(),
             "limit_pure": limit, "limit_same_boundary": 0.003,
-            "pass": error_pure <= limit and error_pure <= 0.01 and error_boundary <= 0.003}
-    if bf16_pv64 is not None:
-        result["relative_l2_same_boundary_with_bf16_probability"] = relative(actual, bf16_pv64)
+            "limit_same_operators_fp64_probability": limit,
+            "pass": (error_pure <= limit and error_pure <= 0.01 and error_boundary <= 0.003 and
+                     error_fp64_probability <= limit and error_fp64_probability <= 0.01)}
     return result
 
 
@@ -177,10 +180,8 @@ def main():
                                 torch.float64, same_boundary=True)
             same32 = layer_step(state["inputs"][i], weight32, state["attention"][i], geometry,
                                 torch.float32, same_boundary=True).double()
-            same_pv64 = None
-            if state["attention"][i]["position"] + 1 <= 512:
-                same_pv64 = layer_step(state["inputs"][i], weight64, state["attention"][i], geometry,
-                                       torch.float64, same_boundary=True, bf16_probability=True)
+            same_pv64 = layer_step(state["inputs"][i], weight64, state["attention"][i], geometry,
+                                   torch.float64, same_boundary=True, bf16_probability=True)
             layers.append(frozen_layer_metrics(i, actual, truth, same64, same32, same_pv64))
             assert layers[-1]["pass"], layers[-1]
             rolling64 = layer_step(rolling64, weight64, state["attention"][i], geometry, torch.float64)

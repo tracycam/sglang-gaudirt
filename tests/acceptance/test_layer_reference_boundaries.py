@@ -86,7 +86,7 @@ def main():
     pure = torch.tensor([1.0, 1.0], dtype=torch.float64)
     bad = torch.tensor([1.01, 1.0], dtype=torch.float64)
     wide_floor = torch.tensor([1.1, 1.0], dtype=torch.float64)
-    result = reference.frozen_layer_metrics(0, bad, pure, pure, wide_floor)
+    result = reference.frozen_layer_metrics(0, bad, pure, pure, wide_floor, pure)
     assert result["relative_l2_pure"] < result["limit_pure"] and not result["pass"]
     rejected = multitree.assess_conditioned_kl(0.02, {"1": 0.001, "2": 0.002})
     assert rejected["ref_floor"] == 0.002 and not rejected["kl_pass"]

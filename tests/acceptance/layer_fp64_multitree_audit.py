@@ -65,10 +65,8 @@ def main():
                           same_boundary=True)
             same32 = step(state["inputs"][i], w32, state["attention"][i], geometry, torch.float32,
                           same_boundary=True).double()
-            same_pv64 = None
-            if state["attention"][i]["position"] + 1 <= 512:
-                same_pv64 = step(state["inputs"][i], w64, state["attention"][i], geometry, torch.float64,
-                                 same_boundary=True, bf16_probability=True)
+            same_pv64 = step(state["inputs"][i], w64, state["attention"][i], geometry, torch.float64,
+                             same_boundary=True, bf16_probability=True)
             record = frozen_layer_metrics(i, actual, truth, same64, same32, same_pv64)
             records.append(record)
             print("FROZEN_LAYER", json.dumps(record, sort_keys=True), flush=True)
