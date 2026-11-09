@@ -66,18 +66,16 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
             forward_batch.input_ids,
             self.vocabulary,
         )
-        forward_batch.input_ids = gaudirt.validated_token_ids(self.metadata)
-        self.last_token_indices = gaudirt.validated_last_token_indices(self.metadata)
+        (tokens, self.last_token_indices, self.rotary_positions, self.rotary_header,
+         self.row_locations, self.row_requests, self.attention_plan, self.rotary_context) = \
+            self.metadata.forward_tensors(self.query_heads, pool.head_num, pool.head_dim)
+        tokens._gaudirt_validated_vocab = self.vocabulary
+        self.last_token_indices._gaudirt_validated_rows = tokens.numel()
+        forward_batch.input_ids = tokens
         torch._dynamo.mark_static(self.last_token_indices, 0)
         torch._dynamo.mark_dynamic(forward_batch.input_ids, 0, min=1, max=4096)
         self.forward_batch = forward_batch
         self.positions = forward_batch.positions
-        self.rotary_positions = self.metadata.rotary_positions()
-        self.rotary_header = self.metadata.rotary_header()
-        self.rotary_context = self.metadata.context()
-        self.row_locations = self.metadata.row_locations()
-        self.row_requests = self.metadata.row_requests()
-        self.attention_plan = self.metadata.attention_plan(self.query_heads, pool.head_num, pool.head_dim)
         torch._dynamo.mark_dynamic(self.attention_plan, 0, min=1, max=536870912)
         for tensor in (self.rotary_positions, self.row_locations, self.row_requests):
             torch._dynamo.mark_dynamic(tensor, 0, min=1, max=4096)
