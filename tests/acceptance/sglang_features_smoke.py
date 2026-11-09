@@ -36,6 +36,12 @@ if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1" or capture_values:
                     def layer(*args, previous=previous, index=index):
                         output = previous(*args)
                         feature_values.append((index, output[3][-1].cpu()))
+                        rows = output[3].size(0)
+                        if rows >= 1024:
+                            for value_index, value in enumerate(output):
+                                if isinstance(value, torch.Tensor) and value.ndim and value.size(0) == rows:
+                                    for row in (2, 21):
+                                        feature_values.append((f"{index}_fx{value_index}_row{row}", value[row].cpu()))
                         return output
 
                     segment.forward = layer
