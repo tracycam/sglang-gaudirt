@@ -75,32 +75,73 @@ def rotate(value, heads, dimension, cosine, sine, dtype):
     return torch.cat((a * cosine - b * sine, b * cosine + a * sine), dim=-1)
 
 
-def layer_step(x, weights, attention, geometry, dtype):
+def layer_step(x, weights, attention, geometry, dtype, same_boundary=False, project=None,
+               bf16_probability=False):
     heads, kv_heads, dimension, eps, scale, theta = geometry
     x = x.to(dtype)
-    norm = x * torch.rsqrt((x * x).mean(-1, keepdim=True) + eps) * weights["in_norm"]
-    query = norm @ weights["q"].t()
-    key = norm @ weights["k"].t()
-    value = (norm @ weights["v"].t()).reshape(kv_heads, dimension)
+    if project is None:
+        project = lambda value, weight: value @ weight.t()
+
+    def stored(value):
+        return rounded(value, dtype) if same_boundary else value
+
+    norm = stored(x * torch.rsqrt((x * x).mean(-1, keepdim=True) + eps) * weights["in_norm"])
+    query = stored(project(norm, weights["q"]))
+    key = stored(project(norm, weights["k"]))
+    value = stored(project(norm, weights["v"]).reshape(kv_heads, dimension))
     cosine, sine = cosine_sine(attention["position"], theta, dimension, dtype)
-    query = rotate(query, heads, dimension, cosine, sine, dtype)
-    # The KV pool is an external BF16 state boundary. All other layer
-    # arithmetic, including attention probabilities, stays in the reference dtype.
+    query = stored(rotate(query, heads, dimension, cosine, sine, dtype))
+    # The KV pool is an external BF16 state boundary in both references.
     key = rounded(rotate(key, kv_heads, dimension, cosine, sine, dtype), dtype)
-    value = rounded(value, dtype)
+    if not same_boundary:
+        value = rounded(value, dtype)
     keys = torch.cat((attention["keys"][:-1].to(dtype), key.unsqueeze(0)))
     values = torch.cat((attention["values"][:-1].to(dtype), value.unsqueeze(0)))
     head_map = torch.arange(heads) // (heads // kv_heads)
     scores = torch.einsum("hd,thd->ht", query, keys[:, head_map]) * scale
-    attended = torch.einsum("ht,thd->hd", torch.softmax(scores, dim=-1), values[:, head_map]).reshape(1, -1)
-    projected = attended @ weights["out"].t()
-    residual = projected + x
-    norm = residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + eps) * weights["post_norm"]
-    gate = norm @ weights["gate"].t()
-    up = norm @ weights["up"].t()
-    activated = gate / (1 + torch.exp(-gate)) * up
-    down = activated @ weights["down"].t()
+    # The ordinary same-boundary reference keeps probabilities in the
+    # reference dtype. A separately named diagnostic reproduces the single
+    # tile BF16-PV algorithm, without changing the FP32 reference or gate.
+    probabilities = torch.softmax(scores, dim=-1)
+    if bf16_probability:
+        assert same_boundary and attention["position"] + 1 <= 512
+        probabilities = rounded(probabilities, dtype)
+    attended = stored(torch.einsum("ht,thd->hd", probabilities, values[:, head_map]).reshape(1, -1))
+    projected = stored(project(attended, weights["out"]))
+    residual = stored(projected + x)
+    norm = stored(residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + eps) *
+                  weights["post_norm"])
+    gate = stored(project(norm, weights["gate"]))
+    up = stored(project(norm, weights["up"]))
+    activated = stored(gate / (1 + torch.exp(-gate)) * up)
+    down = stored(project(activated, weights["down"]))
     return rounded(down + residual, dtype)
+
+
+def frozen_layer_metrics(layer, actual, pure64, boundary64, boundary32, bf16_pv64=None):
+    values = (actual, pure64, boundary64, boundary32) + (() if bf16_pv64 is None else (bf16_pv64,))
+    assert all(torch.isfinite(value).all() for value in values)
+
+    def relative(value, reference):
+        denominator = torch.linalg.vector_norm(reference).clamp_min(1e-30)
+        return (torch.linalg.vector_norm(value - reference) / denominator).item()
+
+    error_pure = relative(actual, pure64)
+    error_boundary = relative(actual, boundary64)
+    boundary_vs_pure = relative(boundary32, pure64)
+    arithmetic_difference = relative(boundary32, boundary64)
+    limit = max(3e-3, 2 * boundary_vs_pure)
+    result = {"layer": layer, "relative_l2_pure": error_pure,
+            "fp32_same_boundary_vs_fp64_pure": boundary_vs_pure,
+            "relative_l2_same_boundary": error_boundary,
+            "fp32_vs_fp64_same_boundary": arithmetic_difference,
+            "max_abs_pure": (actual - pure64).abs().max().item(),
+            "max_abs_same_boundary": (actual - boundary64).abs().max().item(),
+            "limit_pure": limit, "limit_same_boundary": 0.003,
+            "pass": error_pure <= limit and error_pure <= 0.01 and error_boundary <= 0.003}
+    if bf16_pv64 is not None:
+        result["relative_l2_same_boundary_with_bf16_probability"] = relative(actual, bf16_pv64)
+    return result
 
 
 def main():
@@ -132,28 +173,31 @@ def main():
             weight32 = {name: value.float() for name, value in stored.items()}
             actual = state["inputs"][i + 1].double()
             truth = layer_step(state["inputs"][i], weight64, state["attention"][i], geometry, torch.float64)
-            floor = layer_step(state["inputs"][i], weight32, state["attention"][i], geometry, torch.float32).double()
-            assert all(torch.isfinite(value).all() for value in (actual, truth, floor))
-            denominator = torch.linalg.vector_norm(truth).clamp_min(1e-30)
-            error = (torch.linalg.vector_norm(actual - truth) / denominator).item()
-            floor_error = (torch.linalg.vector_norm(floor - truth) / denominator).item()
-            max_abs = (actual - truth).abs().max().item()
-            limit = max(3e-3, 2 * floor_error)
-            layers.append({"layer": i, "relative_l2": error, "fp32_floor": floor_error,
-                           "max_abs": max_abs, "limit": limit})
-            assert error <= limit and error <= 1e-2, layers[-1]
+            same64 = layer_step(state["inputs"][i], weight64, state["attention"][i], geometry,
+                                torch.float64, same_boundary=True)
+            same32 = layer_step(state["inputs"][i], weight32, state["attention"][i], geometry,
+                                torch.float32, same_boundary=True).double()
+            same_pv64 = None
+            if state["attention"][i]["position"] + 1 <= 512:
+                same_pv64 = layer_step(state["inputs"][i], weight64, state["attention"][i], geometry,
+                                       torch.float64, same_boundary=True, bf16_probability=True)
+            layers.append(frozen_layer_metrics(i, actual, truth, same64, same32, same_pv64))
+            assert layers[-1]["pass"], layers[-1]
             rolling64 = layer_step(rolling64, weight64, state["attention"][i], geometry, torch.float64)
-            rolling32 = layer_step(rolling32, weight32, state["attention"][i], geometry, torch.float32)
+            rolling32 = layer_step(rolling32, weight32, state["attention"][i], geometry, torch.float32,
+                                   same_boundary=True)
             print("FROZEN_LAYER", json.dumps(layers[-1], sort_keys=True), flush=True)
             del stored, weight64, weight32
 
-        def logits(x, dtype):
+        def logits(x, dtype, same_boundary=False):
             gamma = weights.get("model.norm.weight").to(dtype)
             normalized = x * torch.rsqrt((x * x).mean(-1, keepdim=True) + geometry[3]) * gamma
+            if same_boundary:
+                normalized = rounded(normalized, dtype)
             return rounded(normalized @ weights.get("lm_head.weight").to(dtype).t(), dtype).double()
 
         truth_logits = logits(rolling64, torch.float64)
-        floor_logits = logits(rolling32, torch.float32)
+        floor_logits = logits(rolling32, torch.float32, same_boundary=True)
         candidate_logits = state["logits"].double()
         assert truth_logits.shape == floor_logits.shape == candidate_logits.shape
         assert all(torch.isfinite(value).all() for value in (truth_logits, floor_logits, candidate_logits))
@@ -176,7 +220,7 @@ def main():
         top2_match = bool(top2[tied].all()) if tied.any() else None
         assert kl <= 0.01, (kl, floor_kl)
         assert torch.where(tied, top2, top1).all(), (tied.tolist(), selected.tolist(), top.indices.tolist())
-        result = {"layers": layers, "max_row_relative_l2": max(item["relative_l2"] for item in layers),
+        result = {"layers": layers, "max_row_relative_l2": max(item["relative_l2_pure"] for item in layers),
                   "max_kl": kl, "ref_floor": floor_kl, "kl_limit": 0.01,
                   "top1_match_non_tied": top1_match, "top2_match_tied": top2_match,
                   "tied_samples": tied.sum().item()}

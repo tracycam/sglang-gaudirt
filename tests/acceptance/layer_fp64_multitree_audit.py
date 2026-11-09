@@ -7,7 +7,7 @@ from pathlib import Path
 
 assert os.environ.get("TORCH_DEVICE_BACKEND_AUTOLOAD") == "0"
 import torch
-from layer_fp64_audit import Weights, cosine_sine, rotate, rounded
+from layer_fp64_audit import Weights, frozen_layer_metrics, layer_step, rounded
 
 
 def assess_conditioned_kl(candidate, cpu_trees):
@@ -27,30 +27,10 @@ def project(value, weight, dtype, parts):
     return partial[0]
 
 
-def step(x, weights, attention, geometry, dtype, parts=1):
-    heads, kv_heads, dimension, eps, scale, theta = geometry
-    x = x.to(dtype)
-    norm = x * torch.rsqrt((x * x).mean(-1, keepdim=True) + eps) * weights["in_norm"]
-    query = project(norm, weights["q"], dtype, parts)
-    key = project(norm, weights["k"], dtype, parts)
-    value = project(norm, weights["v"], dtype, parts).reshape(kv_heads, dimension)
-    cosine, sine = cosine_sine(attention["position"], theta, dimension, dtype)
-    query = rotate(query, heads, dimension, cosine, sine, dtype)
-    key = rounded(rotate(key, kv_heads, dimension, cosine, sine, dtype), dtype)
-    value = rounded(value, dtype)
-    keys = torch.cat((attention["keys"][:-1].to(dtype), key.unsqueeze(0)))
-    values = torch.cat((attention["values"][:-1].to(dtype), value.unsqueeze(0)))
-    head_map = torch.arange(heads) // (heads // kv_heads)
-    scores = torch.einsum("hd,thd->ht", query, keys[:, head_map]) * scale
-    attended = torch.einsum("ht,thd->hd", torch.softmax(scores, dim=-1), values[:, head_map]).reshape(1, -1)
-    projected = project(attended, weights["out"], dtype, parts)
-    residual = projected + x
-    norm = residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + eps) * weights["post_norm"]
-    gate = project(norm, weights["gate"], dtype, parts)
-    up = project(norm, weights["up"], dtype, parts)
-    activated = gate / (1 + torch.exp(-gate)) * up
-    down = project(activated, weights["down"], dtype, parts)
-    return rounded(down + residual, dtype)
+def step(x, weights, attention, geometry, dtype, parts=1, same_boundary=False, bf16_probability=False):
+    return layer_step(x, weights, attention, geometry, dtype, same_boundary=same_boundary,
+                      project=lambda value, weight: project(value, weight, dtype, parts),
+                      bf16_probability=bf16_probability)
 
 
 def main():
@@ -81,36 +61,40 @@ def main():
             w32 = {name: value.float() for name, value in stored.items()}
             actual = state["inputs"][i + 1].double()
             truth = step(state["inputs"][i], w64, state["attention"][i], geometry, torch.float64)
-            floor = step(state["inputs"][i], w32, state["attention"][i], geometry, torch.float32).double()
-            assert all(torch.isfinite(value).all() for value in (actual, truth, floor))
-            denominator = torch.linalg.vector_norm(truth).clamp_min(1e-30)
-            error = (torch.linalg.vector_norm(actual - truth) / denominator).item()
-            floor_error = (torch.linalg.vector_norm(floor - truth) / denominator).item()
-            limit = max(3e-3, 2 * floor_error)
-            record = {"layer": i, "relative_l2": error, "fp32_floor": floor_error, "limit": limit,
-                      "max_abs": (actual - truth).abs().max().item(), "pass": error <= limit and error <= 1e-2}
+            same64 = step(state["inputs"][i], w64, state["attention"][i], geometry, torch.float64,
+                          same_boundary=True)
+            same32 = step(state["inputs"][i], w32, state["attention"][i], geometry, torch.float32,
+                          same_boundary=True).double()
+            same_pv64 = None
+            if state["attention"][i]["position"] + 1 <= 512:
+                same_pv64 = step(state["inputs"][i], w64, state["attention"][i], geometry, torch.float64,
+                                 same_boundary=True, bf16_probability=True)
+            record = frozen_layer_metrics(i, actual, truth, same64, same32, same_pv64)
             records.append(record)
             print("FROZEN_LAYER", json.dumps(record, sort_keys=True), flush=True)
             rolling64 = step(rolling64, w64, state["attention"][i], geometry, torch.float64)
             for parts in trees:
                 rolling32[parts] = step(rolling32[parts], w32, state["attention"][i], geometry,
-                                        torch.float32, parts)
+                                        torch.float32, parts, same_boundary=True)
             del stored, w64, w32
         failed = [record["layer"] for record in records if not record["pass"]]
         result = {"layers": records, "failed_layers": failed,
-                  "max_row_relative_l2": max(item["relative_l2"] for item in records)}
+                  "max_row_relative_l2": max(item["relative_l2_pure"] for item in records),
+                  "max_row_relative_l2_same_boundary": max(item["relative_l2_same_boundary"] for item in records)}
         if failed:
             if path := os.environ.get("GAUDIRT_LAYER_RECEIPT"):
                 Path(path).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
             raise AssertionError(f"frozen layer gate failed: {failed}")
 
-        def logits(value, dtype, parts=1):
+        def logits(value, dtype, parts=1, same_boundary=False):
             gamma = weights.get("model.norm.weight").to(dtype)
             normalized = value * torch.rsqrt((value * value).mean(-1, keepdim=True) + geometry[3]) * gamma
+            if same_boundary:
+                normalized = rounded(normalized, dtype)
             return rounded(project(normalized, weights.get("lm_head.weight").to(dtype), dtype, parts), dtype).double()
 
         truth_logits = logits(rolling64, torch.float64)
-        cpu_logits = {parts: logits(rolling32[parts], torch.float32, parts) for parts in trees}
+        cpu_logits = {parts: logits(rolling32[parts], torch.float32, parts, same_boundary=True) for parts in trees}
         candidate = state["logits"].double()
         assert all(value.shape == truth_logits.shape and torch.isfinite(value).all()
                    for value in (candidate, truth_logits, *cpu_logits.values()))
