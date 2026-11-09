@@ -18,7 +18,9 @@ from sglang_gaudirt.platform import GaudiRTSRTPlatform
 from phase5a_feature_prompts import feature_prompts
 
 feature_writes = []
-if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1":
+feature_values = []
+capture_values = bool(os.environ.get("GAUDIRT_FEATURE_CAPTURE_DIR"))
+if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1" or capture_values:
     import gaudirt.compiler as compiler
 
     original_backend = compiler.gaudirt_backend
@@ -28,6 +30,15 @@ if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1":
         segments = list(compiled.__self__.named_children())
         for index, (_, segment) in enumerate(segments):
             if index % 2 != 1:
+                if capture_values and index < len(segments) - 1:
+                    previous = segment.forward
+
+                    def layer(*args, previous=previous, index=index):
+                        output = previous(*args)
+                        feature_values.append((index, output[3][-1].cpu()))
+                        return output
+
+                    segment.forward = layer
                 continue
             nodes = tuple(segment.graph.nodes)
             placeholders = [node for node in nodes if node.op == "placeholder"]
@@ -37,9 +48,12 @@ if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1":
             key_index, value_index = [placeholders.index(node) for node in attention[0].args[1:3]]
             previous = segment.forward
 
-            def paged(*args, previous=previous, key_index=key_index, value_index=value_index):
+            def paged(*args, previous=previous, key_index=key_index, value_index=value_index, index=index):
                 output = previous(*args)
-                feature_writes.append((args[key_index].cpu(), args[value_index].cpu()))
+                if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1":
+                    feature_writes.append((args[key_index].cpu(), args[value_index].cpu()))
+                if capture_values:
+                    feature_values.append((index, output[-1].cpu()))
                 return output
 
             segment.forward = paged
@@ -57,6 +71,7 @@ def audit_prepare(self, forward):
     event_steps = 0
     previous_kv = None
     audit_steps = 0
+    capture_steps = 0
     audit_mode = os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1"
     expected_audit_steps = int(os.environ.get("GAUDIRT_FEATURE_EXPECT_STEPS", "10"))
     if audit_mode:
@@ -87,10 +102,12 @@ def audit_prepare(self, forward):
         event_counts = lambda: (create(), destroy())
 
     def execute(*args, **kwargs):
-        nonlocal previous_events, event_steps, previous_kv, audit_steps
+        nonlocal previous_events, event_steps, previous_kv, audit_steps, capture_steps
         before_events = event_counts() if event_counts else None
         if audit_mode:
             feature_writes.clear()
+        if capture_values:
+            feature_values.clear()
         if os.environ.get("GAUDIRT_TRACE_CONFIG_PATCH") == "1":
             import gaudirt.compiler as compiler
 
@@ -115,6 +132,11 @@ def audit_prepare(self, forward):
             print("FEATURE_CONFIG_PATCH_CALLS", calls, flush=True)
         else:
             output = compiled(*args, **kwargs)
+        if capture_values:
+            capture_steps += 1
+            path = Path(os.environ["GAUDIRT_FEATURE_CAPTURE_DIR"]) / f"step-{capture_steps}.pt"
+            torch.save({"rows": args[0].numel(), "values": list(feature_values),
+                        "logits": output.next_token_logits.cpu()}, path)
         if audit_mode:
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
