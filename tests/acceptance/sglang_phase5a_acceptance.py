@@ -26,12 +26,27 @@ from phase5a_state_audit import check_kv_step
 from sglang_gaudirt.platform import GaudiRTSRTPlatform
 
 layers = int(os.environ["GAUDIRT_EXPECT_LAYERS"])
-prompt_lengths = tuple(int(x) for x in os.environ.get("GAUDIRT_PROMPTS", "137,1053,4096").split(","))
+prompt_lengths = tuple(int(x) for x in os.environ.get("GAUDIRT_PROMPTS", "137,1053,4096").split(",") if x)
 decode_steps = int(os.environ.get("GAUDIRT_DECODE_STEPS", "128"))
-prefix_length = 136
-expected_steps = 3 + len(prompt_lengths) * (decode_steps + 1)
-snapshot_steps = {3 + (i + 1) * (decode_steps + 1) for i in range(len(prompt_lengths))}
+prefix_length = int(os.environ.get("GAUDIRT_FIXED_PREFIX_LENGTH", "136"))
+chunk_size = int(os.environ.get("GAUDIRT_AUDIT_CHUNK_SIZE", "-1"))
+assert prefix_length > 0 and (chunk_size == -1 or chunk_size > 0) and decode_steps >= 0
+
+
+def chunks(length):
+    return 1 if chunk_size == -1 else (length + chunk_size - 1) // chunk_size
+
+
+prefix_end = chunks(prefix_length)
+single_step = prefix_end + 1
+replay_end = single_step + chunks(prefix_length + 1)
+expected_steps = replay_end
+snapshot_steps = {replay_end}
+for length in prompt_lengths:
+    expected_steps += chunks(length) + decode_steps
+    snapshot_steps.add(expected_steps)
 state = {"active": False, "complete": False, "inputs": [], "attention": [], "intermediates": [],
+         "replay_active": False, "replay_inputs": [], "replay_attention": [],
          "writes": [], "compile_deltas": [], "track_compile": False, "rows": 0}
 original_backend = compiler.gaudirt_backend
 original_prepare = GaudiRTSRTPlatform.prepare_model_forward
@@ -75,6 +90,8 @@ def audit_backend(graph, inputs):
                     state["attention"].append({"position": position, "query": query.cpu(), "key": key_cpu,
                                                 "value": value_cpu, "keys": keys, "values": values,
                                                 "output": output.cpu()})
+                if state["replay_active"]:
+                    state["replay_attention"].append(output[-1:].cpu())
                 return output
 
             segment.forward = paged
@@ -89,6 +106,8 @@ def audit_backend(graph, inputs):
                         assert delta == 0, (state["rows"], index, delta)
                 if state["active"]:
                     state["inputs"].append(output[3].cpu())
+                if state["replay_active"]:
+                    state["replay_inputs"].append(output[3][-1:].cpu())
                 return output
 
             segment.forward = layer_input
@@ -106,12 +125,15 @@ def audit_backend(graph, inputs):
 
             def last_layer(*args, previous=previous, audit_segment=audit_segment, audit_compiled=audit_compiled):
                 output = previous(*args)
-                if state["active"]:
+                if state["active"] or state["replay_active"]:
                     if not audit_compiled:
                         audit_compiled.append(compiler._program_backend(audit_segment, args))
                     audited, residual = audit_compiled[0](*args)
                     assert torch.equal(output.cpu().view(torch.uint8), audited.cpu().view(torch.uint8))
-                    state["inputs"].append(residual.cpu())
+                    if state["active"]:
+                        state["inputs"].append(residual.cpu())
+                    else:
+                        state["replay_inputs"].append(residual[-1:].cpu())
                 return output
 
             segment.forward = last_layer
@@ -148,7 +170,8 @@ def audit_prepare(self, forward):
     def execute(*args, **kwargs):
         nonlocal previous, fixed_prefix, single_logits, step
         rows = args[0].numel()
-        state.update(active=not state["complete"] and rows == 1, writes=[], rows=rows,
+        state.update(active=not state["complete"] and step + 1 == single_step,
+                     replay_active=step + 1 == replay_end, writes=[], rows=rows,
                      track_compile=rows not in seen_rows)
         seen_rows.add(rows)
         output = compiled(*args, **kwargs)
@@ -169,24 +192,32 @@ def audit_prepare(self, forward):
         # untouched bytes at every step, including their finite-value status.
         previous = check_kv_step(previous, buffers, state["writes"], locations)
         step += 1
-        if step <= 3:
-            assert rows == (prefix_length if step == 1 else 1 if step == 2 else prefix_length + 1)
+        if step in (prefix_end, single_step, replay_end):
+            if step == single_step:
+                assert rows == 1
             request = int(backend.row_requests.cpu()[-1])
             slots = backend.req_to_token_pool.req_to_token.cpu()[request, :prefix_length].long()
             current = [buffer[slots].clone() for buffer in buffers]
-            if step == 1:
+            if step == prefix_end:
                 fixed_prefix = current
             else:
                 assert all(torch.equal(a.view(torch.int16), b.view(torch.int16))
                            for a, b in zip(fixed_prefix, current)), "same-prefix KV differs"
-            if step == 2:
+            if step == single_step:
                 single_logits = logits.double()
-            if step == 3:
+            if step == replay_end:
                 other = logits.double()
                 relative = (torch.linalg.vector_norm(other - single_logits) /
                             torch.linalg.vector_norm(single_logits).clamp_min(1e-30)).item()
                 maximum = (other - single_logits).abs().max().item()
-                assert relative <= 0.003, (relative, maximum)
+                assert torch.equal(other, single_logits), (relative, maximum)
+                assert len(state["replay_inputs"]) == len(state["inputs"]) == layers + 1
+                assert len(state["replay_attention"]) == len(state["attention"]) == layers
+                for index, (single, replay) in enumerate(zip(state["inputs"], state["replay_inputs"])):
+                    assert torch.equal(single.view(torch.uint8), replay.view(torch.uint8)), ("layer input", index)
+                for index, (single, replay) in enumerate(zip(state["attention"], state["replay_attention"])):
+                    assert torch.equal(single["output"].view(torch.uint8), replay.view(torch.uint8)), (
+                        "layer attention", index)
                 print("MODEL_SAME_PREFIX", json.dumps({"relative_l2": relative, "max_abs": maximum}), flush=True)
         emit(struct.pack("<QQ", step, rows))
         emit(bytes_of(locations))
@@ -248,7 +279,7 @@ def main():
                     model_loader_extra_config=os.environ.get("GAUDIRT_MODEL_LOADER_CONFIG", "{}"),
                     page_size=int(os.environ.get("GAUDIRT_TEST_PAGE_SIZE", "1")),
                     disable_cuda_graph=True, disable_radix_cache=True, disable_overlap_schedule=True,
-                    chunked_prefill_size=-1, log_level="warning")
+                    chunked_prefill_size=chunk_size, log_level="warning")
     results = []
     try:
         prefix = ids(prefix_length)

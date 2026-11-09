@@ -62,20 +62,40 @@ is warmed for the complete output length before its measured request. The CPU
 fault test for the state audit runs with
 `python tests/acceptance/test_phase5a_state_audit.py`.
 
-For the 52-layer prefix-cache and chunked-prefill comparison, set the following
-before the plain measurement so it writes the matching uncached token outputs;
-these requests run outside the timing windows. Then run the enabled service
-check with the same warm recipe cache:
+For the prefix-cache comparison, both arms use the same context, page size and
+chunking. The second request shares 1024 tokens. The check compares both token
+sequences and every byte of each request's first-step logits; a reference with
+different geometry or chunking is rejected. These checks are outside timing
+windows.
 
 ```sh
 export GAUDIRT_FEATURE_PREFIX=1024 GAUDIRT_FEATURE_SUFFIX=137
-export GAUDIRT_FEATURE_REFERENCE_OUT="$ARTIFACTS/features-plain.json"
-# Run sglang_phase5a_plain.py as above, then:
-GAUDIRT_FEATURE_MODE=enabled GAUDIRT_TEST_PAGE_SIZE=16 \
-GAUDIRT_FEATURE_CONTEXT=32768 GAUDIRT_FEATURE_MAX_TOKENS=4608 \
-GAUDIRT_FEATURE_CHUNK_SIZE=1024 GAUDIRT_FEATURE_MIN_CACHED=1024 \
-GAUDIRT_EXPECT_WARM=1 GAUDIRT_FEATURE_REFERENCE="$ARTIFACTS/features-plain.json" \
-GAUDIRT_FEATURE_RECEIPT="$ARTIFACTS/features-enabled.json" \
-GAUDIRT_SITE_AUDIT_LOG="$ARTIFACTS/features-process.jsonl" \
+export GAUDIRT_FEATURE_MODE=enabled GAUDIRT_TEST_PAGE_SIZE=16
+export GAUDIRT_FEATURE_CONTEXT=32768 GAUDIRT_FEATURE_MAX_TOKENS=4608
+export GAUDIRT_FEATURE_CHUNK_SIZE=1024 GAUDIRT_FEATURE_MIN_CACHED=1024
+GAUDIRT_FEATURE_RADIX=0 GAUDIRT_FEATURE_LOGITS_DIR="$ARTIFACTS/off-logits" \
+GAUDIRT_FEATURE_RECEIPT="$ARTIFACTS/features-off.json" \
+GAUDIRT_SITE_AUDIT_LOG="$ARTIFACTS/features-off-process.jsonl" \
+  python tests/acceptance/sglang_features_smoke.py
+
+GAUDIRT_FEATURE_RADIX=1 GAUDIRT_FEATURE_LOGITS_DIR="$ARTIFACTS/on-logits" \
+GAUDIRT_FEATURE_REFERENCE="$ARTIFACTS/features-off.json" \
+GAUDIRT_FEATURE_LOGITS_REFERENCE="$ARTIFACTS/off-logits" \
+GAUDIRT_FEATURE_RECEIPT="$ARTIFACTS/features-on.json" \
+GAUDIRT_SITE_AUDIT_LOG="$ARTIFACTS/features-on-process.jsonl" \
   python tests/acceptance/sglang_features_smoke.py
 ```
+
+For same-configuration cold/warm full-pool checking, use a fresh recipe cache
+and set `GAUDIRT_FEATURE_STATE_AUDIT=1`, `GAUDIRT_FEATURE_EXPECT_STEPS=9`,
+`GAUDIRT_AUDIT_MODE=cold` then `warm`, `GAUDIRT_TRACE_PATH` to the same trace,
+and `GAUDIRT_FEATURE_STATE_RECEIPT` and `GAUDIRT_FEATURE_LOGITS_DIR` to distinct
+paths per process. Set `GAUDIRT_EXPECT_WARM=1` only on the warm run. The warm
+run compares every recorded KV byte and logit with the cold trace.
+
+For the chunked same-prefix replay, run with `GAUDIRT_FEATURE_RADIX=0` and an
+empty `GAUDIRT_FEATURE_REPLAY_DIR`. The script compares the M=1 logits with the
+last row of the 1024+137 chunked replay byte for byte. Run this separately from
+the full-pool trace. Unchunked versus chunked uses different arithmetic trees;
+its validation is the per-layer reference and conditioned KL gate, not a
+greedy-token equality assertion.

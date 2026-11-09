@@ -129,6 +129,8 @@ def audit_prepare(self, forward):
     previous_kv = None
     audit_steps = 0
     capture_steps = 0
+    completed_prefills = 0
+    request_index = -1
     audit_mode = os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1"
     expected_audit_steps = int(os.environ.get("GAUDIRT_FEATURE_EXPECT_STEPS", "10"))
     if audit_mode:
@@ -160,6 +162,7 @@ def audit_prepare(self, forward):
 
     def execute(*args, **kwargs):
         nonlocal previous_events, event_steps, previous_kv, audit_steps, capture_steps
+        nonlocal completed_prefills, request_index
         before_events = event_counts() if event_counts else None
         if audit_mode:
             feature_writes.clear()
@@ -189,6 +192,33 @@ def audit_prepare(self, forward):
             print("FEATURE_CONFIG_PATCH_CALLS", calls, flush=True)
         else:
             output = compiled(*args, **kwargs)
+        if os.environ.get("GAUDIRT_FEATURE_LOGITS_DIR") or os.environ.get("GAUDIRT_FEATURE_REPLAY_DIR"):
+            from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+            batch = args[2]
+            if batch.forward_mode == ForwardMode.EXTEND:
+                prefixes, lengths = batch.extend_prefix_lens_cpu, batch.extend_seq_lens_cpu
+                assert len(prefixes) == len(lengths) == 1
+                if prefixes[0] == 0:
+                    request_index += 1
+                end = prefixes[0] + lengths[0]
+                prompt_length = int(os.environ.get("GAUDIRT_FEATURE_PREFIX", "160")) + int(
+                    os.environ.get("GAUDIRT_FEATURE_SUFFIX", "9"))
+                if end == prompt_length and completed_prefills < 2:
+                    logits = output.next_token_logits.cpu().contiguous()
+                    assert torch.isfinite(logits).all()
+                    path = Path(os.environ["GAUDIRT_FEATURE_LOGITS_DIR"]) / f"request-{completed_prefills}.bin"
+                    path.write_bytes(logits.view(torch.uint8).numpy().tobytes())
+                    completed_prefills += 1
+                if os.environ.get("GAUDIRT_FEATURE_REPLAY_DIR") and request_index == 3 and end == prompt_length:
+                    logits = output.next_token_logits.cpu().contiguous()
+                    assert torch.isfinite(logits).all()
+                    torch.save(logits, Path(os.environ["GAUDIRT_FEATURE_REPLAY_DIR"]) / "chunk.pt")
+            elif (os.environ.get("GAUDIRT_FEATURE_REPLAY_DIR") and
+                  batch.forward_mode == ForwardMode.DECODE and request_index == 2):
+                logits = output.next_token_logits.cpu().contiguous()
+                assert torch.isfinite(logits).all()
+                torch.save(logits, Path(os.environ["GAUDIRT_FEATURE_REPLAY_DIR"]) / "single.pt")
         if capture_values:
             capture_steps += 1
             path = Path(os.environ["GAUDIRT_FEATURE_CAPTURE_DIR"]) / f"step-{capture_steps}.pt"
@@ -252,12 +282,24 @@ def main():
     assert radix in ("0", "1")
     chunk_size = int(os.environ.get("GAUDIRT_FEATURE_CHUNK_SIZE", "64" if enabled else "-1"))
     page_size = int(os.environ.get("GAUDIRT_TEST_PAGE_SIZE", "1"))
+    context = int(os.environ.get("GAUDIRT_FEATURE_CONTEXT", "1024"))
     vocabulary = config["vocab_size"]
     prompts = feature_prompts(vocabulary)
+    logits_dir = Path(os.environ["GAUDIRT_FEATURE_LOGITS_DIR"])
+    logits_dir.mkdir(parents=True, exist_ok=True)
+    assert not list(logits_dir.glob("request-*.bin")), "logits directory must be empty"
+    replay_dir = os.environ.get("GAUDIRT_FEATURE_REPLAY_DIR")
+    if replay_dir:
+        assert radix == "0" and chunk_size > 0, "same-prefix replay requires uncached chunked prefill"
+        assert os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") != "1", "run state audit separately from replay"
+        Path(replay_dir).mkdir(parents=True, exist_ok=True)
+        assert not any((Path(replay_dir) / f"{name}.pt").exists() for name in ("single", "chunk"))
+    contract = {"context_length": context, "page_size": page_size, "chunked_prefill_size": chunk_size,
+                "prompt_lengths": [len(prompt) for prompt in prompts], "vocabulary": vocabulary}
     engine = Engine(
         model_path=str(model), skip_tokenizer_init=True, device="gaudirt", dtype="bfloat16",
         tp_size=1, max_total_tokens=int(os.environ.get("GAUDIRT_FEATURE_MAX_TOKENS", "1024")),
-        max_running_requests=1, context_length=int(os.environ.get("GAUDIRT_FEATURE_CONTEXT", "1024")),
+        max_running_requests=1, context_length=context,
         mem_fraction_static=0.9, model_loader_extra_config='{"enable_multithread_load":false}',
         page_size=page_size, disable_cuda_graph=True, disable_radix_cache=radix == "0",
         disable_overlap_schedule=True,
@@ -270,7 +312,11 @@ def main():
         }) for prompt in prompts]
         output = [{"tokens": result["output_ids"],
                    "cached_tokens": result["meta_info"]["cached_tokens"]} for result in results]
-        Path(os.environ["GAUDIRT_FEATURE_RECEIPT"]).write_text(json.dumps(output, indent=2) + "\n")
+        logits = [(logits_dir / f"request-{index}.bin").read_bytes() for index in range(len(output))]
+        assert all(logits), "missing first-step logits"
+        receipt = {"contract": contract, "radix": radix == "1", "requests": output,
+                   "first_logits_sha256": [hashlib.sha256(value).hexdigest() for value in logits]}
+        Path(os.environ["GAUDIRT_FEATURE_RECEIPT"]).write_text(json.dumps(receipt, indent=2) + "\n")
         print("FEATURE_OUTPUT", json.dumps(output), flush=True)
         assert all(len(item["tokens"]) == 4 for item in output), output
         if radix == "1":
@@ -279,7 +325,28 @@ def main():
             assert output[1]["cached_tokens"] == 0, output
         if reference := os.environ.get("GAUDIRT_FEATURE_REFERENCE"):
             expected = json.loads(Path(reference).read_text())
-            assert [item["tokens"] for item in output] == [item["tokens"] for item in expected], output
+            assert expected["contract"] == contract, "bit-exact comparison requires the same context, page and chunking"
+            assert [item["tokens"] for item in output] == [item["tokens"] for item in expected["requests"]], output
+            reference_logits = Path(os.environ["GAUDIRT_FEATURE_LOGITS_REFERENCE"])
+            assert all(value == (reference_logits / f"request-{index}.bin").read_bytes()
+                       for index, value in enumerate(logits)), "first-step logits differ"
+        if replay_dir:
+            replay_length = len(prompts[0]) - 1
+            replay_prefix = [3 + (i * 53 + 701) % (vocabulary - 3) for i in range(replay_length)]
+            first = engine.generate(input_ids=replay_prefix, sampling_params={
+                "temperature": 0, "max_new_tokens": 2, "ignore_eos": True,
+            })
+            second = engine.generate(input_ids=replay_prefix + first["output_ids"][:1], sampling_params={
+                "temperature": 0, "max_new_tokens": 1, "ignore_eos": True,
+            })
+            single = torch.load(Path(replay_dir) / "single.pt", weights_only=True)
+            chunk = torch.load(Path(replay_dir) / "chunk.pt", weights_only=True)
+            assert single.shape == chunk.shape and single.dtype == chunk.dtype
+            maximum = (single.double() - chunk.double()).abs().max().item()
+            print("FEATURE_SAME_PREFIX", json.dumps({"max_abs": maximum, "bit_exact": torch.equal(single, chunk)}),
+                  flush=True)
+            assert torch.equal(single.view(torch.uint8), chunk.view(torch.uint8)), ("same-prefix logits differ", maximum)
+            assert first["output_ids"][1:] == second["output_ids"]
         if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1":
             summary = json.loads(Path(os.environ["GAUDIRT_FEATURE_STATE_RECEIPT"]).read_text())
             assert summary["steps"] == int(os.environ.get("GAUDIRT_FEATURE_EXPECT_STEPS", "10"))
