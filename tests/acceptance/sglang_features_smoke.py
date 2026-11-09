@@ -56,6 +56,9 @@ if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1" or capture_values:
                 if capture_values:
                     for name, tensor_index in (("query", query_index), ("key", key_index), ("value", value_index)):
                         feature_values.append((f"{index}_{name}", args[tensor_index][-1].cpu()))
+                        if args[tensor_index].size(0) >= 1024:
+                            for row in (2, 21):
+                                feature_values.append((f"{index}_{name}_row{row}", args[tensor_index][row].cpu()))
                     if os.environ.get("GAUDIRT_FEATURE_CAPTURE_KV") == "1" and args[query_index].size(0) > 1:
                         from sglang.srt.model_executor.forward_context import get_attn_backend
 
