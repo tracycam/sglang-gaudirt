@@ -65,10 +65,14 @@ if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1" or capture_values:
                             norm = audited[-1]
                             for original, replay in zip(output, audited[:-1]):
                                 if isinstance(original, torch.Tensor) and original.ndim and original.size(0) == rows:
+                                    if os.environ.get("GAUDIRT_FEATURE_CAPTURE_NORM_ALL") == "1":
+                                        assert torch.equal(original.cpu(), replay.cpu())
                                     for row in (2, 21):
                                         assert torch.equal(original[row].cpu(), replay[row].cpu())
                             for row in (2, 21):
                                 feature_values.append((f"{index}_norm_row{row}", norm[row].cpu()))
+                            if os.environ.get("GAUDIRT_FEATURE_CAPTURE_NORM_ALL") == "1":
+                                feature_values.append((f"{index}_norm_all", norm.cpu()))
                         if rows >= 1024:
                             for value_index, value in enumerate(output):
                                 if isinstance(value, torch.Tensor) and value.ndim and value.size(0) == rows:
