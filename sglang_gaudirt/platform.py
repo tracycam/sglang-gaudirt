@@ -71,9 +71,7 @@ class GaudiRTSRTPlatform(SRTPlatform):
             torch.set_num_threads(threads)
 
     def prepare_rope_cache(self, cache):
-        if cache.device.type != "cpu" or cache.dtype != torch.bfloat16:
-            raise ValueError("GaudiRT RoPE requires a CPU BF16 lookup table")
-        return cache.to("gaudirt:0", non_blocking=True)
+        return gaudirt._reserve_rotary_cache(cache)
 
     def rope_cache_computation_device(self, cache_device):
         return torch.device("cpu")

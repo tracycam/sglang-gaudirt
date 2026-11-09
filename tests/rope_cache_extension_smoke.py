@@ -19,8 +19,10 @@ def main():
 
     get_context().set_server_args(SimpleNamespace(rl_on_policy_target=None))
     rope = RotaryEmbedding(128, 128, 64, 10000, True, torch.bfloat16)
+    assert rope.cos_sin_cache.untyped_storage().nbytes() >= 131072 * 128 * 2
     before = rope.cos_sin_cache.cpu().clone()
     rope._ensure_cos_sin_cache_length(129)
+    assert rope.cos_sin_cache.untyped_storage().nbytes() >= 131072 * 128 * 2
     after = rope.cos_sin_cache.cpu()
     assert after.shape[0] > 129 and torch.equal(after[:64], before)
     with current_platform.rope_cache_initialization_context():
