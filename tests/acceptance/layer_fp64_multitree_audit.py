@@ -27,10 +27,11 @@ def project(value, weight, dtype, parts):
     return partial[0]
 
 
-def step(x, weights, attention, geometry, dtype, parts=1, same_boundary=False, bf16_probability=False):
+def step(x, weights, attention, geometry, dtype, parts=1, same_boundary=False, bf16_probability=False,
+         bf16_pv_tile=None):
     return layer_step(x, weights, attention, geometry, dtype, same_boundary=same_boundary,
                       project=lambda value, weight: project(value, weight, dtype, parts),
-                      bf16_probability=bf16_probability)
+                      bf16_probability=bf16_probability, bf16_pv_tile=bf16_pv_tile)
 
 
 def main():
@@ -38,6 +39,10 @@ def main():
     directory = Path(os.environ["GAUDIRT_TARGET_MODEL"])
     config = json.loads((directory / "config.json").read_text())
     count = config["num_hidden_layers"]
+    tile_arg = os.environ.get("GAUDIRT_AUDIT_PV_TILE")
+    pv_tile = int(tile_arg) if tile_arg is not None else None
+    if pv_tile is not None and pv_tile <= 0:
+        raise ValueError("GAUDIRT_AUDIT_PV_TILE must be positive")
     state = torch.load(os.environ["GAUDIRT_LAYER_CAPTURE_PATH"], map_location="cpu", weights_only=True)
     assert len(state["inputs"]) == count + 1 and len(state["attention"]) == count
     dim = config["head_dim"]
@@ -66,7 +71,7 @@ def main():
             same32 = step(state["inputs"][i], w32, state["attention"][i], geometry, torch.float32,
                           same_boundary=True).double()
             same_pv64 = step(state["inputs"][i], w64, state["attention"][i], geometry, torch.float64,
-                             same_boundary=True, bf16_probability=True)
+                             same_boundary=True, bf16_probability=True, bf16_pv_tile=pv_tile)
             record = frozen_layer_metrics(i, actual, truth, same64, same32, same_pv64)
             records.append(record)
             print("FROZEN_LAYER", json.dumps(record, sort_keys=True), flush=True)
@@ -76,7 +81,7 @@ def main():
                                         torch.float32, parts, same_boundary=True)
             del stored, w64, w32
         failed = [record["layer"] for record in records if not record["pass"]]
-        result = {"layers": records, "failed_layers": failed,
+        result = {"layers": records, "failed_layers": failed, "bf16_pv_tile": pv_tile,
                   "max_row_relative_l2": max(item["relative_l2_pure"] for item in records),
                   "max_row_relative_l2_same_boundary": max(item["relative_l2_same_boundary"] for item in records)}
         if failed:

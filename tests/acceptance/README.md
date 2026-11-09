@@ -49,6 +49,12 @@ python tests/acceptance/verify_process_audit.py "$ARTIFACTS/process-audit.json" 
   "$ARTIFACTS/plain-process.jsonl"
 ```
 
+For a captured online prefix longer than 512 tokens, set
+`GAUDIRT_AUDIT_PV_TILE` to the actual KV tile used by that attention path.
+The BF16-PV reference rounds each tile's probability input before its P@V
+and merges tiles in FP64; the main CPU FP32 reference keeps probabilities in
+FP32. A long-prefix reference without an explicit tile fails immediately.
+
 The plain measurement uses pretokenized `Engine.generate` inputs and excludes
 tokenization and HTTP. Its process-isolation audit runs at process entry and
 exit; no per-step state audit or profiler is enabled during timing. Each prompt

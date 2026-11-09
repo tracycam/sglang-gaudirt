@@ -75,8 +75,36 @@ def rotate(value, heads, dimension, cosine, sine, dtype):
     return torch.cat((a * cosine - b * sine, b * cosine + a * sine), dim=-1)
 
 
+def tiled_bf16_pv(scores, values, head_map, tile, dtype):
+    """Independent FP64/FP32 tile reference with BF16 inputs to each P@V."""
+    if not isinstance(tile, int) or isinstance(tile, bool) or tile <= 0:
+        raise ValueError("BF16-PV reference requires a positive KV tile")
+    merged_max = merged_sum = merged_output = None
+    for start in range(0, scores.size(-1), tile):
+        tile_scores = scores[:, start:start + tile]
+        tile_max = tile_scores.amax(dim=-1)
+        exponential = (tile_scores - tile_max[:, None]).exp()
+        tile_sum = exponential.sum(dim=-1)
+        probability = rounded(exponential / tile_sum[:, None], dtype)
+        tile_values = values[start:start + tile, head_map]
+        tile_output = torch.einsum("ht,thd->hd", probability, tile_values) * tile_sum[:, None]
+        if merged_max is None:
+            merged_max, merged_sum, merged_output = tile_max, tile_sum, tile_output
+            continue
+        maximum = torch.maximum(merged_max, tile_max)
+        a, b = (merged_max - maximum).exp(), (tile_max - maximum).exp()
+        merged_output = a[:, None] * merged_output + b[:, None] * tile_output
+        merged_sum = a * merged_sum + b * tile_sum
+        merged_max = maximum
+    return merged_output / merged_sum[:, None]
+
+
 def layer_step(x, weights, attention, geometry, dtype, same_boundary=False, project=None,
-               bf16_probability=False):
+               bf16_probability=False, bf16_pv_tile=None):
+    if bf16_probability and not same_boundary:
+        raise ValueError("BF16-PV requires the same-boundary reference")
+    if bf16_probability and bf16_pv_tile is None and attention["position"] + 1 > 512:
+        raise ValueError("long BF16-PV references require the actual KV tile")
     heads, kv_heads, dimension, eps, scale, theta = geometry
     x = x.to(dtype)
     if project is None:
@@ -99,14 +127,18 @@ def layer_step(x, weights, attention, geometry, dtype, same_boundary=False, proj
     values = torch.cat((attention["values"][:-1].to(dtype), value.unsqueeze(0)))
     head_map = torch.arange(heads) // (heads // kv_heads)
     scores = torch.einsum("hd,thd->ht", query, keys[:, head_map]) * scale
-    # The ordinary same-boundary reference keeps probabilities in the
-    # reference dtype. A separately named diagnostic reproduces the single
-    # tile BF16-PV algorithm, without changing the FP32 reference or gate.
-    probabilities = torch.softmax(scores, dim=-1)
+    # The main same-boundary reference keeps probabilities in the reference
+    # dtype. The separate BF16-PV reference follows the actual KV tiling.
     if bf16_probability:
-        assert same_boundary and attention["position"] + 1 <= 512
-        probabilities = rounded(probabilities, dtype)
-    attended = stored(torch.einsum("ht,thd->hd", probabilities, values[:, head_map]).reshape(1, -1))
+        if bf16_pv_tile is None:
+            probabilities = rounded(torch.softmax(scores, dim=-1), dtype)
+            attended = torch.einsum("ht,thd->hd", probabilities, values[:, head_map])
+        else:
+            attended = tiled_bf16_pv(scores, values, head_map, bf16_pv_tile, dtype)
+    else:
+        probabilities = torch.softmax(scores, dim=-1)
+        attended = torch.einsum("ht,thd->hd", probabilities, values[:, head_map])
+    attended = stored(attended.reshape(1, -1))
     projected = stored(project(attended, weights["out"]))
     residual = stored(projected + x)
     norm = stored(residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + eps) *
@@ -152,6 +184,10 @@ def main():
     directory = Path(os.environ["GAUDIRT_TARGET_MODEL"])
     config = json.loads((directory / "config.json").read_text())
     count = config["num_hidden_layers"]
+    tile_arg = os.environ.get("GAUDIRT_AUDIT_PV_TILE")
+    pv_tile = int(tile_arg) if tile_arg is not None else None
+    if pv_tile is not None and pv_tile <= 0:
+        raise ValueError("GAUDIRT_AUDIT_PV_TILE must be positive")
     state = torch.load(os.environ["GAUDIRT_LAYER_CAPTURE_PATH"], map_location="cpu", weights_only=True)
     assert len(state["inputs"]) == count + 1 and len(state["attention"]) == count
     dimension = config["head_dim"]
@@ -181,7 +217,8 @@ def main():
             same32 = layer_step(state["inputs"][i], weight32, state["attention"][i], geometry,
                                 torch.float32, same_boundary=True).double()
             same_pv64 = layer_step(state["inputs"][i], weight64, state["attention"][i], geometry,
-                                   torch.float64, same_boundary=True, bf16_probability=True)
+                                   torch.float64, same_boundary=True, bf16_probability=True,
+                                   bf16_pv_tile=pv_tile)
             layers.append(frozen_layer_metrics(i, actual, truth, same64, same32, same_pv64))
             assert layers[-1]["pass"], layers[-1]
             rolling64 = layer_step(rolling64, weight64, state["attention"][i], geometry, torch.float64)
@@ -221,7 +258,8 @@ def main():
         top2_match = bool(top2[tied].all()) if tied.any() else None
         assert kl <= 0.01, (kl, floor_kl)
         assert torch.where(tied, top2, top1).all(), (tied.tolist(), selected.tolist(), top.indices.tolist())
-        result = {"layers": layers, "max_row_relative_l2": max(item["relative_l2_pure"] for item in layers),
+        result = {"layers": layers, "bf16_pv_tile": pv_tile,
+                  "max_row_relative_l2": max(item["relative_l2_pure"] for item in layers),
                   "max_kl": kl, "ref_floor": floor_kl, "kl_limit": 0.01,
                   "top1_match_non_tied": top1_match, "top2_match_tied": top2_match,
                   "tied_samples": tied.sum().item()}

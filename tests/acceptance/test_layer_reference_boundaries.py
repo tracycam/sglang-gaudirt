@@ -78,11 +78,53 @@ def main():
     assert torch.equal(same, expected)
     assert torch.equal(same, multitree.step(x, weights, attention, geometry, torch.float32,
                                            1, same_boundary=True))
+    assert torch.equal(same, reference.layer_step(x, weights, attention, geometry, torch.float32,
+                                                  same_boundary=True, bf16_pv_tile=1))
     boundaries.clear()
     with patch.object(reference, "rounded", track):
         reference.layer_step(x, weights, attention, geometry, torch.float32,
                              same_boundary=True, bf16_probability=True)
     assert len(boundaries) == 16 and boundaries[6] == (heads, 2), boundaries
+
+    # Build the same block probabilities from a global FP64 softmax and
+    # combine them by their exact probability mass, independently of the
+    # online max/sum recurrence used by the reference implementation.
+    scores = torch.randn(heads, 9, generator=generator, dtype=torch.float64)
+    values = value(9, kv_heads, dim).double()
+    head_map = torch.arange(heads) // (heads // kv_heads)
+    global_probability = scores.softmax(-1)
+    expected_tiled = torch.zeros(heads, dim, dtype=torch.float64)
+    for start in range(0, scores.size(-1), 4):
+        block = global_probability[:, start:start + 4]
+        mass = block.sum(-1)
+        probability = reference.rounded(block / mass[:, None], torch.float64)
+        expected_tiled += mass[:, None] * torch.einsum(
+            "ht,thd->hd", probability, values[start:start + 4, head_map])
+    tiled = reference.tiled_bf16_pv(scores, values, head_map, 4, torch.float64)
+    assert torch.allclose(tiled, expected_tiled, rtol=1e-12, atol=1e-12)
+    single = reference.tiled_bf16_pv(scores, values, head_map, 16, torch.float64)
+    expected_single = torch.einsum("ht,thd->hd", reference.rounded(global_probability, torch.float64),
+                                   values[:, head_map])
+    assert torch.allclose(single, expected_single, rtol=1e-12, atol=1e-12)
+    for invalid_tile in (0, -1, True):
+        try:
+            reference.tiled_bf16_pv(scores, values, head_map, invalid_tile, torch.float64)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid BF16-PV tile accepted")
+    long_attention = {"position": 512, "keys": value(513, kv_heads, dim),
+                      "values": value(513, kv_heads, dim)}
+    try:
+        reference.layer_step(x, weights, long_attention, geometry, torch.float32,
+                             same_boundary=True, bf16_probability=True)
+    except ValueError as error:
+        assert "actual KV tile" in str(error)
+    else:
+        raise AssertionError("long BF16-PV reference accepted an unspecified tile")
+    long_result = reference.layer_step(x, weights, long_attention, geometry, torch.float32,
+                                       same_boundary=True, bf16_probability=True, bf16_pv_tile=128)
+    assert torch.isfinite(long_result).all()
     pure = torch.tensor([1.0, 1.0], dtype=torch.float64)
     bad = torch.tensor([1.01, 1.0], dtype=torch.float64)
     wide_floor = torch.tensor([1.1, 1.0], dtype=torch.float64)
