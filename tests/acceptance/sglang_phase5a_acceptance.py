@@ -30,7 +30,11 @@ prompt_lengths = tuple(int(x) for x in os.environ.get("GAUDIRT_PROMPTS", "137,10
 decode_steps = int(os.environ.get("GAUDIRT_DECODE_STEPS", "128"))
 prefix_length = int(os.environ.get("GAUDIRT_FIXED_PREFIX_LENGTH", "136"))
 chunk_size = int(os.environ.get("GAUDIRT_AUDIT_CHUNK_SIZE", "-1"))
+cross_tree = os.environ.get("GAUDIRT_AUDIT_CROSS_TREE") == "1"
 assert prefix_length > 0 and (chunk_size == -1 or chunk_size > 0) and decode_steps >= 0
+if cross_tree:
+    assert chunk_size > 0 and os.environ.get("GAUDIRT_REPLAY_LAYER_CAPTURE_PATH"), (
+        "cross-tree validation requires chunking and a separate replay capture")
 
 
 def chunks(length):
@@ -58,6 +62,7 @@ def audit_backend(graph, inputs):
     captures += 1
     assert captures == 1, "model forward was captured more than once"
     compiled = original_backend(graph, inputs)
+    compiled.__self__.enable_trace()
     segments = list(compiled.__self__.named_children())
     assert len(segments) == 2 * layers + 1, len(segments)
     for index, (_, segment) in enumerate(segments):
@@ -77,30 +82,31 @@ def audit_backend(graph, inputs):
                 )
                 key_cpu, value_cpu = key.cpu(), value.cpu()
                 state["writes"].append((key_cpu, value_cpu))
-                if state["active"]:
-                    assert query.shape[0] == 1
-                    position, request, location = int(positions.cpu()[0]), int(requests.cpu()[0]), int(locations.cpu()[0])
+                if state["active"] or state["replay_active"]:
+                    if state["active"]:
+                        assert query.shape[0] == 1
+                    position, request, location = (int(tensor.cpu()[-1])
+                                                    for tensor in (positions, requests, locations))
                     from sglang.srt.model_executor.forward_context import get_attn_backend
                     mapping = get_attn_backend().req_to_token_pool.req_to_token
                     slots = mapping.cpu()[request, :position + 1].long()
                     assert int(slots[-1]) == location
                     keys, values = key_pool.cpu()[slots].clone(), value_pool.cpu()[slots].clone()
-                    assert torch.equal(keys[-1].reshape(1, -1).view(torch.int16), key_cpu.view(torch.int16))
-                    assert torch.equal(values[-1].reshape(1, -1).view(torch.int16), value_cpu.view(torch.int16))
-                    state["attention"].append({"position": position, "query": query.cpu(), "key": key_cpu,
-                                                "value": value_cpu, "keys": keys, "values": values,
-                                                "output": output.cpu()})
-                if state["replay_active"]:
-                    state["replay_attention"].append(output[-1:].cpu())
+                    assert torch.equal(keys[-1].reshape(1, -1).view(torch.int16), key_cpu[-1:].view(torch.int16))
+                    assert torch.equal(values[-1].reshape(1, -1).view(torch.int16), value_cpu[-1:].view(torch.int16))
+                    attention_capture = {"position": position, "query": query[-1:].cpu(), "key": key_cpu[-1:],
+                                         "value": value_cpu[-1:], "keys": keys, "values": values,
+                                         "output": output[-1:].cpu()}
+                    target = "attention" if state["active"] else "replay_attention"
+                    state[target].append(attention_capture)
                 return output
 
             segment.forward = paged
         elif index < len(segments) - 1:
             def layer_input(*args, previous=previous, index=index):
-                before = gaudirt.recipe_cache_stats()[1] if state["track_compile"] else None
                 output = previous(*args)
-                if before is not None:
-                    delta = gaudirt.recipe_cache_stats()[1] - before
+                if state["track_compile"]:
+                    delta = compiled.__self__.trace_compile_delta(index)
                     state["compile_deltas"].append({"rows": state["rows"], "segment": index, "compiled": delta})
                     if index >= 4:
                         assert delta == 0, (state["rows"], index, delta)
@@ -210,15 +216,21 @@ def audit_prepare(self, forward):
                 relative = (torch.linalg.vector_norm(other - single_logits) /
                             torch.linalg.vector_norm(single_logits).clamp_min(1e-30)).item()
                 maximum = (other - single_logits).abs().max().item()
-                assert torch.equal(other, single_logits), (relative, maximum)
                 assert len(state["replay_inputs"]) == len(state["inputs"]) == layers + 1
                 assert len(state["replay_attention"]) == len(state["attention"]) == layers
-                for index, (single, replay) in enumerate(zip(state["inputs"], state["replay_inputs"])):
-                    assert torch.equal(single.view(torch.uint8), replay.view(torch.uint8)), ("layer input", index)
-                for index, (single, replay) in enumerate(zip(state["attention"], state["replay_attention"])):
-                    assert torch.equal(single["output"].view(torch.uint8), replay.view(torch.uint8)), (
-                        "layer attention", index)
-                print("MODEL_SAME_PREFIX", json.dumps({"relative_l2": relative, "max_abs": maximum}), flush=True)
+                if cross_tree:
+                    torch.save({"inputs": state["replay_inputs"], "attention": state["replay_attention"],
+                                "intermediates": [], "logits": logits},
+                               os.environ["GAUDIRT_REPLAY_LAYER_CAPTURE_PATH"])
+                else:
+                    assert torch.equal(other, single_logits), (relative, maximum)
+                    for index, (single, replay) in enumerate(zip(state["inputs"], state["replay_inputs"])):
+                        assert torch.equal(single.view(torch.uint8), replay.view(torch.uint8)), ("layer input", index)
+                    for index, (single, replay) in enumerate(zip(state["attention"], state["replay_attention"])):
+                        assert torch.equal(single["output"].view(torch.uint8), replay["output"].view(torch.uint8)), (
+                            "layer attention", index)
+                print("MODEL_SAME_PREFIX", json.dumps({"relative_l2": relative, "max_abs": maximum,
+                                                       "cross_tree": cross_tree}), flush=True)
         emit(struct.pack("<QQ", step, rows))
         emit(bytes_of(locations))
         emit(bytes_of(logits))
@@ -242,7 +254,8 @@ def audit_prepare(self, forward):
             trace.close()
             summary = {"mode": mode, "layers": layers, "steps": step, "model_captures": captures,
                        "cache": gaudirt.recipe_cache_stats(), "peak_hbm_bytes": gaudirt.max_memory_allocated(),
-                       "trace_sha256": digest.hexdigest(), "compile_deltas": state["compile_deltas"]}
+                       "trace_sha256": digest.hexdigest(), "compile_deltas": state["compile_deltas"],
+                       "same_prefix_check": "independent_fp64_required" if cross_tree else "bit_exact"}
             Path(os.environ["GAUDIRT_SUMMARY_PATH"]).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
             print("FULL_AUDIT", json.dumps(summary, sort_keys=True), flush=True)
         return output
@@ -290,7 +303,8 @@ def main():
             "temperature": 0, "max_new_tokens": 1, "ignore_eos": True,
         })
         assert len(first["output_ids"]) == 2 and len(second["output_ids"]) == 1
-        assert first["output_ids"][1:] == second["output_ids"]
+        if not cross_tree:
+            assert first["output_ids"][1:] == second["output_ids"]
         results.append({"prefix_tokens": prefix_length, "outputs": first["output_ids"],
                         "replay_outputs": second["output_ids"]})
         for length in prompt_lengths:

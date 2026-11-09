@@ -19,7 +19,7 @@ from sglang_gaudirt.attention import GaudiRTPagedAttnBackend
 layers = int(os.environ["GAUDIRT_EXPECT_LAYERS"])
 warm_output = int(os.environ.get("GAUDIRT_PROFILE_WARM_OUTPUT", "128"))
 sample_steps = {warm_output + 1, warm_output + 2, 2 * warm_output + 3, 2 * warm_output + 4}
-state = {"active": False, "segments": [], "events": [], "calls": [], "step": 0, "metadata": None,
+state = {"active": False, "segments": [], "events": [], "executor": None, "step": 0, "metadata": None,
          "whole_events": None, "metadata_events": None}
 original_backend = compiler.gaudirt_backend
 original_prepare = GaudiRTSRTPlatform.prepare_model_forward
@@ -42,28 +42,11 @@ def profiling_metadata(self, batch):
 
 def profiling_backend(graph, inputs):
     compiled = original_backend(graph, inputs)
-    segments = list(compiled.__self__.named_children())
+    executor = compiled.__self__
+    segments = list(executor.split.named_children())
     assert len(segments) == 2 * layers + 1 and not state["segments"]
     state["segments"] = segments
-    for index, (_, segment) in enumerate(segments):
-        previous = segment.forward
-
-        def timed(*args, previous=previous, index=index):
-            if not state["active"]:
-                return previous(*args)
-            start, end = state["events"][index]
-            before = time.perf_counter_ns()
-            start.record()
-            launched = time.perf_counter_ns()
-            output = previous(*args)
-            returned = time.perf_counter_ns()
-            end.record()
-            recorded = time.perf_counter_ns()
-            state["calls"].append((index, (returned - launched) / 1e6,
-                                   (launched - before + recorded - returned) / 1e6))
-            return output
-
-        segment.forward = timed
+    state["executor"] = executor
     return compiled
 
 
@@ -90,26 +73,27 @@ def profiling_prepare(self, forward):
             raise RuntimeError("profiling events were not prepared during warmup")
         whole_start, whole_end = state["whole_events"]
         cache_before = gaudirt.recipe_cache_stats()
-        state["calls"] = []
         state["active"] = True
+        state["executor"].profile(state["events"])
         whole_start.record()
         before = time.perf_counter_ns()
         try:
             output = compiled(*args, **kwargs)
         finally:
             state["active"] = False
+            state["executor"].profile(None)
         submitted = time.perf_counter_ns()
         whole_end.record()
         whole_end.synchronize()
-        calls = sorted(state["calls"])
-        assert len(calls) == len(state["segments"]) and [item[0] for item in calls] == list(range(len(calls)))
+        calls = state["executor"].profile_host_ms
+        assert len(calls) == len(state["segments"])
         records = []
-        for index, host_ms, event_host_ms in calls:
+        for index, host_ms in enumerate(calls):
             start, end = state["events"][index]
             start.synchronize()
             end.synchronize()
             records.append({"segment": index, "kind": "attention" if index % 2 else "fx",
-                            "host_call_ms": host_ms, "event_record_host_ms": event_host_ms,
+                            "host_call_ms": host_ms, "event_record_host_ms": None,
                             "compute_stream_ms": start.elapsed_time(end)})
         whole_start.synchronize()
         assert state["metadata"] is not None

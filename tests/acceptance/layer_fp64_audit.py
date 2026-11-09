@@ -130,7 +130,7 @@ def layer_step(x, weights, attention, geometry, dtype, same_boundary=False, proj
     # The main same-boundary reference keeps probabilities in the reference
     # dtype. The separate BF16-PV reference follows the actual KV tiling.
     if bf16_probability:
-        if bf16_pv_tile is None:
+        if bf16_pv_tile is None or bf16_pv_tile == "full":
             probabilities = rounded(torch.softmax(scores, dim=-1), dtype)
             attended = torch.einsum("ht,thd->hd", probabilities, values[:, head_map])
         else:
@@ -185,8 +185,8 @@ def main():
     config = json.loads((directory / "config.json").read_text())
     count = config["num_hidden_layers"]
     tile_arg = os.environ.get("GAUDIRT_AUDIT_PV_TILE")
-    pv_tile = int(tile_arg) if tile_arg is not None else None
-    if pv_tile is not None and pv_tile <= 0:
+    pv_tile = "full" if tile_arg == "full" else int(tile_arg) if tile_arg is not None else None
+    if pv_tile is not None and pv_tile != "full" and pv_tile <= 0:
         raise ValueError("GAUDIRT_AUDIT_PV_TILE must be positive")
     state = torch.load(os.environ["GAUDIRT_LAYER_CAPTURE_PATH"], map_location="cpu", weights_only=True)
     assert len(state["inputs"]) == count + 1 and len(state["attention"]) == count

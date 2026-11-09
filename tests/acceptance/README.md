@@ -94,15 +94,19 @@ paths per process. Set `GAUDIRT_EXPECT_WARM=1` only on the warm run. The warm
 run compares every recorded KV byte and logit with the cold trace.
 
 For the chunked same-prefix replay, run with `GAUDIRT_FEATURE_RADIX=0` and an
-empty `GAUDIRT_FEATURE_REPLAY_DIR`. The script compares the M=1 logits with the
-last row of the 1024+137 chunked replay byte for byte. Run this separately from
-the full-pool trace. Unchunked versus chunked uses different arithmetic trees;
-its validation is the per-layer reference and conditioned KL gate, not a
-greedy-token equality assertion.
+empty `GAUDIRT_FEATURE_REPLAY_DIR`. The script reports the M=1 and chunked
+last-row difference; this diagnostic alone is not a numerical acceptance.
+Set `GAUDIRT_FEATURE_REPLAY_REQUIRE_EXACT=1` only when both requests use the
+same arithmetic path. Run separately from the full-pool trace. Different
+arithmetic trees require the per-layer reference and conditioned KL gate.
 
 To capture the chunked replay for the per-layer reference, run the main state
 audit with `GAUDIRT_FIXED_PREFIX_LENGTH=1160`, `GAUDIRT_AUDIT_CHUNK_SIZE=1024`,
-`GAUDIRT_PROMPTS=''` and `GAUDIRT_DECODE_STEPS=0`. The audit compares the
-replayed last-row inputs and attention output at every layer to M=1. Run the
-FP64 audit on its capture with `GAUDIRT_AUDIT_PV_TILE=512`; the primary FP32
-reference still keeps attention probabilities in FP32.
+`GAUDIRT_PROMPTS=''` and `GAUDIRT_DECODE_STEPS=0`. For full-row Decode versus
+512-key tiled prefill, also set `GAUDIRT_AUDIT_CROSS_TREE=1` and provide a
+separate `GAUDIRT_REPLAY_LAYER_CAPTURE_PATH`. Run the independent FP64 audit on
+the original capture with `GAUDIRT_AUDIT_PV_TILE=full`, and on the replay
+capture with `GAUDIRT_AUDIT_PV_TILE=512`. Each must satisfy the full per-layer
+and conditioned KL gates. The primary FP32 reference keeps attention
+probabilities in FP32. Without cross-tree mode, the main audit still requires
+byte-identical same-path outputs.

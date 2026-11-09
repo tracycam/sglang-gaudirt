@@ -125,6 +125,12 @@ def main():
     long_result = reference.layer_step(x, weights, long_attention, geometry, torch.float32,
                                        same_boundary=True, bf16_probability=True, bf16_pv_tile=128)
     assert torch.isfinite(long_result).all()
+    boundaries.clear()
+    with patch.object(reference, "rounded", track), \
+         patch.object(reference, "tiled_bf16_pv", side_effect=AssertionError("full-row path must not tile")):
+        full_result = reference.layer_step(x, weights, long_attention, geometry, torch.float32,
+                                           same_boundary=True, bf16_probability=True, bf16_pv_tile="full")
+    assert torch.isfinite(full_result).all() and boundaries.count((heads, 513)) == 1
     pure = torch.tensor([1.0, 1.0], dtype=torch.float64)
     bad = torch.tensor([1.01, 1.0], dtype=torch.float64)
     wide_floor = torch.tensor([1.1, 1.0], dtype=torch.float64)
