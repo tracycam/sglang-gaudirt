@@ -169,6 +169,9 @@ def main():
     assert config["num_hidden_layers"] == int(os.environ.get("GAUDIRT_EXPECT_LAYERS", "2"))
     enabled = os.environ["GAUDIRT_FEATURE_MODE"] == "enabled"
     assert enabled or os.environ["GAUDIRT_FEATURE_MODE"] == "plain"
+    radix = os.environ.get("GAUDIRT_FEATURE_RADIX", "1" if enabled else "0")
+    assert radix in ("0", "1")
+    chunk_size = int(os.environ.get("GAUDIRT_FEATURE_CHUNK_SIZE", "64" if enabled else "-1"))
     page_size = int(os.environ.get("GAUDIRT_TEST_PAGE_SIZE", "1"))
     vocabulary = config["vocab_size"]
     prompts = feature_prompts(vocabulary)
@@ -177,9 +180,9 @@ def main():
         tp_size=1, max_total_tokens=int(os.environ.get("GAUDIRT_FEATURE_MAX_TOKENS", "1024")),
         max_running_requests=1, context_length=int(os.environ.get("GAUDIRT_FEATURE_CONTEXT", "1024")),
         mem_fraction_static=0.9, model_loader_extra_config='{"enable_multithread_load":false}',
-        page_size=page_size, disable_cuda_graph=True, disable_radix_cache=not enabled,
+        page_size=page_size, disable_cuda_graph=True, disable_radix_cache=radix == "0",
         disable_overlap_schedule=True,
-        chunked_prefill_size=int(os.environ.get("GAUDIRT_FEATURE_CHUNK_SIZE", "64")) if enabled else -1,
+        chunked_prefill_size=chunk_size,
         log_level="warning",
     )
     try:
@@ -188,8 +191,10 @@ def main():
         }) for prompt in prompts]
         output = [{"tokens": result["output_ids"],
                    "cached_tokens": result["meta_info"]["cached_tokens"]} for result in results]
+        Path(os.environ["GAUDIRT_FEATURE_RECEIPT"]).write_text(json.dumps(output, indent=2) + "\n")
+        print("FEATURE_OUTPUT", json.dumps(output), flush=True)
         assert all(len(item["tokens"]) == 4 for item in output), output
-        if enabled:
+        if radix == "1":
             assert output[1]["cached_tokens"] >= int(os.environ.get("GAUDIRT_FEATURE_MIN_CACHED", "128")), output
         else:
             assert output[1]["cached_tokens"] == 0, output
@@ -201,8 +206,6 @@ def main():
             assert summary["steps"] == int(os.environ.get("GAUDIRT_FEATURE_EXPECT_STEPS", "10"))
             if os.environ["GAUDIRT_AUDIT_MODE"] == "warm":
                 assert summary["cache"][1] == 0, summary
-        Path(os.environ["GAUDIRT_FEATURE_RECEIPT"]).write_text(json.dumps(output, indent=2) + "\n")
-        print("FEATURE_OUTPUT", json.dumps(output), flush=True)
     finally:
         workers = list(zip(engine.tokenizer_manager._subprocess_watchdog._names,
                            engine.tokenizer_manager._subprocess_watchdog._processes))
