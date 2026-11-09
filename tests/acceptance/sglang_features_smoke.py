@@ -45,21 +45,24 @@ if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1" or capture_values:
             attention = [node for node in nodes if node.op == "call_function" and
                          node.target == torch.ops.gaudirt._paged_attn_validated.default]
             assert len(attention) == 1
-            indexes = [placeholders.index(node) for node in attention[0].args[:9]]
+            indexes = [placeholders.index(node) for node in attention[0].args[:8]]
             previous = segment.forward
 
             def paged(*args, previous=previous, index=index, indexes=indexes):
                 output = previous(*args)
-                query_index, key_index, value_index, key_pool_index, value_pool_index, _, request_index, position_index, map_index = indexes
+                query_index, key_index, value_index, key_pool_index, value_pool_index, _, request_index, position_index = indexes
                 if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1":
                     feature_writes.append((args[key_index].cpu(), args[value_index].cpu()))
                 if capture_values:
                     for name, tensor_index in (("query", query_index), ("key", key_index), ("value", value_index)):
                         feature_values.append((f"{index}_{name}", args[tensor_index][-1].cpu()))
                     if os.environ.get("GAUDIRT_FEATURE_CAPTURE_KV") == "1" and args[query_index].size(0) > 1:
+                        from sglang.srt.model_executor.forward_context import get_attn_backend
+
                         request = int(args[request_index][-1].cpu())
                         position = int(args[position_index][-1].cpu())
-                        slots = args[map_index].cpu()[request, :position + 1].long()
+                        mapping = get_attn_backend().req_to_token_pool.req_to_token
+                        slots = mapping.cpu()[request, :position + 1].long()
                         feature_values.append((f"{index}_keys", args[key_pool_index].cpu()[slots]))
                         feature_values.append((f"{index}_values", args[value_pool_index].cpu()[slots]))
                     feature_values.append((index, output[-1].cpu()))
