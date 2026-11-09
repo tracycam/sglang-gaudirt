@@ -55,3 +55,21 @@ exit; no per-step state audit or profiler is enabled during timing. Each prompt
 is warmed for the complete output length before its measured request. The CPU
 fault test for the state audit runs with
 `python tests/acceptance/test_phase5a_state_audit.py`.
+
+For the 52-layer prefix-cache and chunked-prefill comparison, set the following
+before the plain measurement so it writes the matching uncached token outputs;
+these requests run outside the timing windows. Then run the enabled service
+check with the same warm recipe cache:
+
+```sh
+export GAUDIRT_FEATURE_PREFIX=1024 GAUDIRT_FEATURE_SUFFIX=137
+export GAUDIRT_FEATURE_REFERENCE_OUT="$ARTIFACTS/features-plain.json"
+# Run sglang_phase5a_plain.py as above, then:
+GAUDIRT_FEATURE_MODE=enabled GAUDIRT_TEST_PAGE_SIZE=16 \
+GAUDIRT_FEATURE_CONTEXT=32768 GAUDIRT_FEATURE_MAX_TOKENS=4608 \
+GAUDIRT_FEATURE_CHUNK_SIZE=1024 GAUDIRT_FEATURE_MIN_CACHED=1024 \
+GAUDIRT_EXPECT_WARM=1 GAUDIRT_FEATURE_REFERENCE="$ARTIFACTS/features-plain.json" \
+GAUDIRT_FEATURE_RECEIPT="$ARTIFACTS/features-enabled.json" \
+GAUDIRT_SITE_AUDIT_LOG="$ARTIFACTS/features-process.jsonl" \
+  python tests/acceptance/sglang_features_smoke.py
+```

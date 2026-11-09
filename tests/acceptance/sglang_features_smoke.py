@@ -58,6 +58,7 @@ def audit_prepare(self, forward):
     previous_kv = None
     audit_steps = 0
     audit_mode = os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1"
+    expected_audit_steps = int(os.environ.get("GAUDIRT_FEATURE_EXPECT_STEPS", "10"))
     if audit_mode:
         from phase5a_state_audit import check_kv_step
 
@@ -128,7 +129,7 @@ def audit_prepare(self, forward):
             for value in (locations, logits, *buffers):
                 emit(value)
             audit_steps += 1
-            if audit_steps == 10:
+            if audit_steps == expected_audit_steps:
                 if mode == "warm":
                     assert not trace.read(1), "cold trace has extra records"
                 trace.close()
@@ -197,7 +198,7 @@ def main():
             assert [item["tokens"] for item in output] == [item["tokens"] for item in expected], output
         if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1":
             summary = json.loads(Path(os.environ["GAUDIRT_FEATURE_STATE_RECEIPT"]).read_text())
-            assert summary["steps"] == 10
+            assert summary["steps"] == int(os.environ.get("GAUDIRT_FEATURE_EXPECT_STEPS", "10"))
             if os.environ["GAUDIRT_AUDIT_MODE"] == "warm":
                 assert summary["cache"][1] == 0, summary
         Path(os.environ["GAUDIRT_FEATURE_RECEIPT"]).write_text(json.dumps(output, indent=2) + "\n")
