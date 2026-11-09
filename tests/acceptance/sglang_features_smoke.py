@@ -1,8 +1,10 @@
 """Compare ordinary SGLang inference with chunking and prefix caching enabled."""
 
+import copy
 import hashlib
 import json
 import os
+import operator
 import struct
 import sys
 from pathlib import Path
@@ -32,11 +34,41 @@ if os.environ.get("GAUDIRT_FEATURE_STATE_AUDIT") == "1" or capture_values:
             if index % 2 != 1:
                 if capture_values and index < len(segments) - 1:
                     previous = segment.forward
+                    audit_segment = None
+                    audit_compiled = []
+                    if index == 0 and os.environ.get("GAUDIRT_FEATURE_CAPTURE_NORM") == "1":
+                        audit_segment = copy.deepcopy(segment)
+                        norms = [node for node in audit_segment.graph.nodes if node.op == "call_function" and
+                                 node.target in (torch.ops.gaudirt.rms_norm.default,
+                                                 torch.ops.gaudirt.fused_add_rms_norm.default)]
+                        assert len(norms) == 1, audit_segment.graph
+                        norm = norms[0]
+                        if norm.target == torch.ops.gaudirt.fused_add_rms_norm.default:
+                            with audit_segment.graph.inserting_after(norm):
+                                norm = audit_segment.graph.call_function(operator.getitem, (norm, 0))
+                        result = next(node for node in audit_segment.graph.nodes if node.op == "output")
+                        original_outputs = result.args[0]
+                        if not isinstance(original_outputs, (tuple, list)):
+                            original_outputs = (original_outputs,)
+                        result.args = ((*original_outputs, norm),)
+                        audit_segment.graph.lint()
 
-                    def layer(*args, previous=previous, index=index):
+                    def layer(*args, previous=previous, index=index, audit_segment=audit_segment,
+                              audit_compiled=audit_compiled):
                         output = previous(*args)
                         feature_values.append((index, output[3][-1].cpu()))
                         rows = output[3].size(0)
+                        if rows >= 1024 and audit_segment is not None:
+                            if not audit_compiled:
+                                audit_compiled.append(compiler._program_backend(audit_segment, args))
+                            audited = audit_compiled[0](*args)
+                            norm = audited[-1]
+                            for original, replay in zip(output, audited[:-1]):
+                                if isinstance(original, torch.Tensor) and original.ndim and original.size(0) == rows:
+                                    for row in (2, 21):
+                                        assert torch.equal(original[row].cpu(), replay[row].cpu())
+                            for row in (2, 21):
+                                feature_values.append((f"{index}_norm_row{row}", norm[row].cpu()))
                         if rows >= 1024:
                             for value_index, value in enumerate(output):
                                 if isinstance(value, torch.Tensor) and value.ndim and value.size(0) == rows:
