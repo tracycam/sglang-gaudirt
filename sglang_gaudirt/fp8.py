@@ -7,6 +7,8 @@ from gaudi_kernels.fp8_codec import reencode_e4m3fn_half
 
 
 def prepare_block_weight(layer, scale_name):
+    if getattr(layer, "input_scale", None) is not None:
+        raise ValueError("GaudiRT FP8: static activation scales are not implemented")
     weight = layer.weight
     scales = getattr(layer, scale_name)
     if (weight.dtype != torch.float8_e4m3fn or weight.ndim != 2 or
@@ -34,7 +36,43 @@ def prepare_block_weight(layer, scale_name):
     layer.input_scale = None
 
 
+def prepare_channel_weight(layer, scale_name):
+    weight = layer.weight
+    scales = getattr(layer, scale_name)
+    if getattr(layer, "input_scale", None) is not None:
+        raise ValueError("GaudiRT FP8: static activation scales are not implemented")
+    if (weight.dtype != torch.float8_e4m3fn or weight.ndim != 2 or scales.dtype != torch.float32 or
+            weight.device != scales.device):
+        raise ValueError("GaudiRT FP8: expected an OCP matrix and FP32 scales on the same device")
+    n, k = weight.shape
+    if n <= 0 or k <= 0 or n % 128 or k % 128:
+        raise ValueError("GaudiRT FP8: channel matrix must have aligned geometry")
+    device = weight.device
+    raw = weight.detach().cpu().contiguous()
+    raw_scales = scales.detach().cpu().reshape(-1).contiguous()
+    if raw_scales.numel() == 1:
+        raw_scales = raw_scales.expand(n).contiguous()
+    elif raw_scales.numel() != n:
+        widths = getattr(layer, "logical_widths", None)
+        if not widths or len(widths) != raw_scales.numel() or sum(widths) != n or min(widths) <= 0:
+            raise ValueError("GaudiRT FP8: scales do not match merged weight partitions")
+        raw_scales = torch.repeat_interleave(raw_scales, torch.tensor(widths, dtype=torch.int64, device="cpu"))
+    encoded, adjusted, _ = reencode_e4m3fn_half(raw, raw_scales)
+    del weight, scales
+    layer.weight = None
+    setattr(layer, scale_name, None)
+    layer.weight = Parameter(encoded.to(device), requires_grad=False)
+    setattr(layer, scale_name, Parameter(adjusted.to(device), requires_grad=False))
+    layer.input_scale = None
+
+
 def block_fp8_linear(input, weight, block_size, weight_scale, input_scale=None, bias=None):
     if tuple(block_size) != (128, 128) or input_scale is not None:
         raise ValueError("GaudiRT FP8: only dynamic activation and 128x128 weight blocks are supported")
     return torch.ops.gaudirt.block_fp8_linear.default(input, weight, weight_scale, bias)
+
+
+def fp8_linear(input, weight, weight_scale, input_scale=None, input_scale_ub=None, bias=None):
+    if input_scale is not None or input_scale_ub is not None:
+        raise ValueError("GaudiRT FP8: static or bounded activation scales are not implemented")
+    return torch.ops.gaudirt.fp8_linear.default(input, weight, weight_scale, bias)
