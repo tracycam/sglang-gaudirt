@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 
 class GaudiRTTokenToKVPoolAllocator(TokenToKVPoolAllocator):
     def __init__(self, size, page_size, dtype, device, kvcache, need_sort):
-        if page_size not in (1, 16, 64) or need_sort or size % page_size:
+        if page_size not in (1, 16, 64) or need_sort or size % page_size or size >= 2**31:
             raise ValueError("GaudiRT supports unsorted KV pages of size 1, 16, or 64")
         if size // page_size > 8192 and page_size > 1:
             raise ValueError("GaudiRT paged KV allocator supports at most 8192 pages")
@@ -23,7 +23,14 @@ class GaudiRTTokenToKVPoolAllocator(TokenToKVPoolAllocator):
 
     def clear(self):
         if self.page_size == 1:
-            return super().clear()
+            # The request table and attention metadata store 32-bit slot IDs.
+            # Keep the allocator in that same representation so every decode
+            # write does not require a separate device cast.
+            self.free_pages = torch.arange(1, self.size + 1, dtype=torch.int32, device=self.device)
+            self.release_pages = torch.empty((0,), dtype=torch.int32, device=self.device)
+            self.is_not_in_free_group = True
+            self.free_group = []
+            return
         self.free_pages = torch.arange(1, self.num_pages + 1, dtype=torch.int64, device=self.device)
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
         self.is_not_in_free_group = True
@@ -75,6 +82,8 @@ class GaudiRTTokenToKVPoolAllocator(TokenToKVPoolAllocator):
 
     def free(self, free_index):
         if self.page_size == 1:
+            if free_index.dtype != torch.int32:
+                free_index = free_index.to(torch.int32)
             return super().free(free_index)
         if not free_index.numel():
             return
