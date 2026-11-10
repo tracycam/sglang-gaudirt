@@ -37,6 +37,24 @@ def quantized_project(value, weight):
     return ocp_activation(value, value.dtype) @ weight.t()
 
 
+def pure_quantized_project(value, weight):
+    """Pure-layer FP64 path: no BF16 storage at internal linear inputs."""
+    if value.dtype != torch.float64 or value.shape[-1] % 128:
+        raise ValueError("pure FP8 reference requires FP64 inputs with aligned width")
+    group = value.reshape(-1, value.shape[-1] // 128, 128)
+    scale = group.abs().amax(-1, keepdim=True).float().clamp_min(1e-10) / 448.0
+    magnitude = (group / scale.double()).abs().clamp_max(448.0).contiguous()
+    levels = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).double()
+    upper = torch.searchsorted(levels, magnitude).clamp(1, 126)
+    lower = upper - 1
+    low_distance = magnitude - levels[lower]
+    high_distance = levels[upper] - magnitude
+    choose_upper = (high_distance < low_distance) | ((high_distance == low_distance) & ((lower & 1) != 0))
+    quantized = torch.where(choose_upper, levels[upper], levels[lower])
+    quantized = torch.where(torch.signbit(group), -quantized, quantized)
+    return (quantized * scale.double()).reshape(value.shape) @ weight.t()
+
+
 def unquantized_project(value, weight):
     return rounded(value, value.dtype) @ weight.t()
 
@@ -46,6 +64,18 @@ def row_error(actual, reference):
     denominator = torch.linalg.vector_norm(reference, dim=-1)
     assert (denominator > 0).all()
     return (torch.linalg.vector_norm(actual - reference, dim=-1) / denominator).max().item()
+
+
+def reference_gate_overlap(pure, same_boundary, pure_limit, boundary_limit):
+    """Necessary triangle-inequality condition for both relative L2 gates."""
+    assert torch.isfinite(pure).all() and torch.isfinite(same_boundary).all()
+    pure_norm = torch.linalg.vector_norm(pure).item()
+    boundary_norm = torch.linalg.vector_norm(same_boundary).item()
+    separation = torch.linalg.vector_norm(pure - same_boundary).item()
+    allowed = pure_limit * pure_norm + boundary_limit * boundary_norm
+    return {"reference_separation_l2": separation, "pure_reference_l2_norm": pure_norm,
+            "same_boundary_reference_l2_norm": boundary_norm, "allowed_separation_l2": allowed,
+            "gates_can_overlap": separation <= allowed}
 
 
 def main():
@@ -95,7 +125,7 @@ def main():
                     w64[name], w32[name] = raw.double(), raw.float()
             x, attention = state["inputs"][i], state["attention"][i]
             actual = state["inputs"][i + 1].double()
-            truth = layer_step(x, w64, attention, geometry, torch.float64, project=quantized_project)
+            truth = layer_step(x, w64, attention, geometry, torch.float64, project=pure_quantized_project)
             same64 = layer_step(x, w64, attention, geometry, torch.float64, same_boundary=True,
                                 project=quantized_project)
             same32 = layer_step(x, w32, attention, geometry, torch.float32, same_boundary=True,
@@ -105,12 +135,14 @@ def main():
             unquantized = layer_step(x, w64, attention, geometry, torch.float64, same_boundary=True,
                                      project=unquantized_project)
             record = frozen_layer_metrics(i, actual, truth, same64, same32, same_pv64)
-            record["fp64_ocp_w8a8_l2"] = row_error(actual, truth)
+            record["fp64_ocp_w8a8_l2"] = row_error(actual, same64)
             record["fp64_unquantized_activation_l2"] = row_error(actual, unquantized)
+            record["reference_gate_overlap"] = reference_gate_overlap(
+                truth, same_pv64, min(0.01, record["limit_pure"]), record["limit_same_boundary"])
             record["pass"] = record["pass"] and record["fp64_ocp_w8a8_l2"] <= 0.02
             records.append(record)
             print("FROZEN_FP8_LAYER", json.dumps(record, sort_keys=True), flush=True)
-            rolling64 = layer_step(rolling64, w64, attention, geometry, torch.float64, project=quantized_project)
+            rolling64 = layer_step(rolling64, w64, attention, geometry, torch.float64, project=pure_quantized_project)
             rolling32 = layer_step(rolling32, w32, attention, geometry, torch.float32, same_boundary=True,
                                    project=quantized_project)
             del w64, w32

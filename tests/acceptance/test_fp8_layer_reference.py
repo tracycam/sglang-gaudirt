@@ -29,6 +29,15 @@ def main():
     assert torch.equal(reference.quantized_project(value, weight), expected_activation @ expected_weight.t())
     assert not torch.equal(reference.unquantized_project(value, weight),
                            reference.quantized_project(value, weight))
+    pure_input = torch.zeros(1, 128, dtype=torch.float64)
+    pure_input[0, :5] = torch.tensor([448.0, 1.0625, 1.1875, -1.0625, 1.0625 + 2**-25], dtype=torch.float64)
+    pure_result = reference.pure_quantized_project(pure_input, torch.eye(128, dtype=torch.float64))
+    assert torch.equal(pure_result[0, :5], torch.tensor([448.0, 1.0, 1.25, -1.0, 1.125], dtype=torch.float64))
+    assert reference.quantized_project(pure_input, torch.eye(128, dtype=torch.float64))[0, 4] == 1.0
+    assert reference.reference_gate_overlap(torch.tensor([1.0]), torch.tensor([1.01]), 0.01, 0.003)[
+        "gates_can_overlap"]
+    assert not reference.reference_gate_overlap(torch.tensor([1.0]), torch.tensor([1.02]), 0.01, 0.003)[
+        "gates_can_overlap"]
     try:
         reference.dequantize_weight(raw, torch.full((2, 2), float("inf")), torch.float64)
     except ValueError:
