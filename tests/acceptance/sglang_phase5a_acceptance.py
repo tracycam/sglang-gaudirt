@@ -51,7 +51,7 @@ for length in prompt_lengths:
     snapshot_steps.add(expected_steps)
 state = {"active": False, "complete": False, "inputs": [], "attention": [], "intermediates": [],
          "replay_active": False, "replay_inputs": [], "replay_attention": [],
-         "writes": [], "compile_deltas": [], "track_compile": False, "rows": 0}
+         "writes": [], "compile_deltas": [], "track_compile": False, "rows": 0, "bound_traced_steps": 0}
 original_backend = compiler.gaudirt_backend
 original_prepare = GaudiRTSRTPlatform.prepare_model_forward
 captures = 0
@@ -62,6 +62,19 @@ def audit_backend(graph, inputs):
     captures += 1
     assert captures == 1, "model forward was captured more than once"
     compiled = original_backend(graph, inputs)
+
+    class AuditRunner:
+        def __init__(self, runner):
+            self.runner = runner
+
+        def __getattr__(self, name):
+            return getattr(self.runner, name)
+
+        def run_bound_traced(self, values, indices):
+            state["bound_traced_steps"] += 1
+            return self.runner.run_bound_traced(values, indices)
+
+    compiled.__self__.runner = AuditRunner(compiled.__self__.runner)
     compiled.__self__.enable_trace()
     segments = list(compiled.__self__.named_children())
     assert len(segments) == 2 * layers + 1, len(segments)
@@ -248,6 +261,7 @@ def audit_prepare(self, forward):
         state["active"] = False
         if step == expected_steps:
             assert state["complete"]
+            assert state["bound_traced_steps"] > 0, "audit did not execute the bound runner"
             if mode == "warm":
                 assert not trace.read(1), "cold trace has extra data"
                 assert gaudirt.recipe_cache_stats()[1] == 0, gaudirt.recipe_cache_stats()
@@ -255,6 +269,7 @@ def audit_prepare(self, forward):
             summary = {"mode": mode, "layers": layers, "steps": step, "model_captures": captures,
                        "cache": gaudirt.recipe_cache_stats(), "peak_hbm_bytes": gaudirt.max_memory_allocated(),
                        "trace_sha256": digest.hexdigest(), "compile_deltas": state["compile_deltas"],
+                       "bound_traced_steps": state["bound_traced_steps"],
                        "same_prefix_check": "independent_fp64_required" if cross_tree else "bit_exact"}
             Path(os.environ["GAUDIRT_SUMMARY_PATH"]).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
             print("FULL_AUDIT", json.dumps(summary, sort_keys=True), flush=True)

@@ -73,10 +73,13 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
         tokens._gaudirt_validated_vocab = self.vocabulary
         self.last_token_indices._gaudirt_validated_rows = tokens.numel()
         forward_batch.input_ids = tokens
-        torch._dynamo.mark_static(self.last_token_indices, 0)
-        torch._dynamo.mark_dynamic(forward_batch.input_ids, 0, min=1, max=4096)
         self.forward_batch = forward_batch
         self.positions = forward_batch.positions
+
+    def mark_capture_inputs(self):
+        """Declare symbolic metadata only when the model graph is captured."""
+        torch._dynamo.mark_static(self.last_token_indices, 0)
+        torch._dynamo.mark_dynamic(self.forward_batch.input_ids, 0, min=1, max=4096)
         torch._dynamo.mark_dynamic(self.attention_plan, 0, min=1, max=536870912)
         for tensor in (self.rotary_positions, self.row_locations, self.row_requests):
             torch._dynamo.mark_dynamic(tensor, 0, min=1, max=4096)

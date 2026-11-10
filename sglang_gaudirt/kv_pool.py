@@ -22,6 +22,8 @@ class GaudiRTMHATokenToKVPool(MHATokenToKVPool):
         # backing storage is [layer, K/V, head, slot, dim].
         self.k_buffer = [self._combined_kv[i, 0].transpose(0, 1) for i in range(self.layer_num)]
         self.v_buffer = [self._combined_kv[i, 1].transpose(0, 1) for i in range(self.layer_num)]
+        for tensor in (*self.k_buffer, *self.v_buffer):
+            tensor._gaudirt_static_binding = True
         self._kv_buffer_descs = []
 
     def get_kv_size_bytes(self):

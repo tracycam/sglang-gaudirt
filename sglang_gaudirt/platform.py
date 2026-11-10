@@ -83,8 +83,10 @@ class GaudiRTSRTPlatform(SRTPlatform):
 
     def prepare_model_forward(self, forward):
         from gaudirt.compiler import compile
+        from sglang.srt.model_executor.forward_context import get_attn_backend
 
-        return compile(forward, dynamic_arg_indices=(0, 1))
+        return compile(forward, dynamic_arg_indices=(0, 1),
+                       prepare_capture=lambda: get_attn_backend().mark_capture_inputs())
 
     def requires_graceful_worker_shutdown(self):
         return True
