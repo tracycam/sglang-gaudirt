@@ -14,7 +14,7 @@ from layer_fp64_audit import Weights, audit_legacy_bridge, frozen_layer_metrics,
 def dequantize_weight(raw, scale, dtype):
     if (raw.dtype != torch.float8_e4m3fn or raw.ndim != 2 or raw.shape[0] % 128 or raw.shape[1] % 128
             or tuple(scale.shape) != (raw.shape[0] // 128, raw.shape[1] // 128)
-            or not torch.isfinite(raw.float()).all() or not torch.isfinite(scale).all()):
+            or not torch.isfinite(raw.float()).all() or not torch.isfinite(scale).all() or (scale < 0).any()):
         raise ValueError("invalid original OCP block weight or scale")
     n, k = raw.shape
     return (raw.to(dtype).reshape(n // 128, 128, k // 128, 128) *
@@ -39,8 +39,8 @@ def quantized_project(value, weight):
 
 def pure_quantized_project(value, weight):
     """Pure-layer FP64 path: no BF16 storage at internal linear inputs."""
-    if value.dtype != torch.float64 or value.shape[-1] % 128:
-        raise ValueError("pure FP8 reference requires FP64 inputs with aligned width")
+    if value.dtype != torch.float64 or value.shape[-1] % 128 or not torch.isfinite(value).all():
+        raise ValueError("pure FP8 reference requires finite FP64 inputs with aligned width")
     group = value.reshape(-1, value.shape[-1] // 128, 128)
     scale = group.abs().amax(-1, keepdim=True).float().clamp_min(1e-10) / 448.0
     magnitude = (group / scale.double()).abs().clamp_max(448.0).contiguous()
@@ -72,6 +72,8 @@ def reference_gate_overlap(pure, same_boundary, pure_limit, boundary_limit):
     pure_norm = torch.linalg.vector_norm(pure).item()
     boundary_norm = torch.linalg.vector_norm(same_boundary).item()
     separation = torch.linalg.vector_norm(pure - same_boundary).item()
+    if not all(math.isfinite(number) for number in (pure_norm, boundary_norm, separation)):
+        raise ValueError("reference norm or separation is nonfinite")
     allowed = pure_limit * pure_norm + boundary_limit * boundary_norm
     return {"reference_separation_l2": separation, "pure_reference_l2_norm": pure_norm,
             "same_boundary_reference_l2_norm": boundary_norm, "allowed_separation_l2": allowed,

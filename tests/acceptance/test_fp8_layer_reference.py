@@ -44,6 +44,13 @@ def main():
         pass
     else:
         raise AssertionError("nonfinite checkpoint scale accepted")
+    pure_input[0, 0] = float("nan")
+    try:
+        reference.pure_quantized_project(pure_input, torch.eye(128, dtype=torch.float64))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("nonfinite pure reference input accepted")
     print("independent OCP W8A8 and unquantized activation references passed", flush=True)
 
 
