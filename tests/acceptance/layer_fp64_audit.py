@@ -99,8 +99,8 @@ def tiled_bf16_pv(scores, values, head_map, tile, dtype):
     return merged_output / merged_sum[:, None]
 
 
-def layer_step(x, weights, attention, geometry, dtype, same_boundary=False, project=None,
-               bf16_probability=False, bf16_pv_tile=None):
+def layer_attention_step(x, weights, attention, geometry, dtype, same_boundary=False, project=None,
+                         bf16_probability=False, bf16_pv_tile=None):
     if bf16_probability and not same_boundary:
         raise ValueError("BF16-PV requires the same-boundary reference")
     if bf16_probability and bf16_pv_tile is None and attention["position"] + 1 > 512:
@@ -138,7 +138,18 @@ def layer_step(x, weights, attention, geometry, dtype, same_boundary=False, proj
     else:
         probabilities = torch.softmax(scores, dim=-1)
         attended = torch.einsum("ht,thd->hd", probabilities, values[:, head_map])
-    attended = stored(attended.reshape(1, -1))
+    return stored(attended.reshape(1, -1))
+
+
+def layer_post_attention_step(x, attended, weights, geometry, dtype, same_boundary=False, project=None):
+    eps = geometry[3]
+    x, attended = x.to(dtype), attended.to(dtype)
+    if project is None:
+        project = lambda value, weight: value @ weight.t()
+
+    def stored(value):
+        return rounded(value, dtype) if same_boundary else value
+
     projected = stored(project(attended, weights["out"]))
     residual = stored(projected + x)
     norm = stored(residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + eps) *
@@ -148,6 +159,13 @@ def layer_step(x, weights, attention, geometry, dtype, same_boundary=False, proj
     activated = stored(gate / (1 + torch.exp(-gate)) * up)
     down = stored(project(activated, weights["down"]))
     return rounded(down + residual, dtype)
+
+
+def layer_step(x, weights, attention, geometry, dtype, same_boundary=False, project=None,
+               bf16_probability=False, bf16_pv_tile=None):
+    attended = layer_attention_step(x, weights, attention, geometry, dtype, same_boundary, project,
+                                    bf16_probability, bf16_pv_tile)
+    return layer_post_attention_step(x, attended, weights, geometry, dtype, same_boundary, project)
 
 
 def frozen_layer_metrics(layer, actual, pure64, boundary64, boundary32, bf16_pv64):

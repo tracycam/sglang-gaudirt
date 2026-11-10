@@ -40,6 +40,29 @@ def main():
         "gates_can_overlap"]
     assert not reference.reference_gate_overlap(torch.tensor([1.0]), torch.tensor([1.02]), 0.01, 0.003)[
         "gates_can_overlap"]
+    projections = {name: 0.002 for name in ("q", "k", "v", "out", "gate", "up", "down")}
+    assert reference.fp8_gates([0.002, 0.002], projections, 0.009, 0.019)
+    assert not reference.fp8_gates([0.0031, 0.002], projections, 0.009, 0.019)
+    assert not reference.fp8_gates([0.002, 0.0031], projections, 0.009, 0.019)
+    for name in projections:
+        assert not reference.fp8_gates([0.002, 0.002], {**projections, name: 0.0031}, 0.009, 0.019)
+    assert not reference.fp8_gates([0.002, 0.002], projections, 0.0101, 0.019)
+    assert not reference.fp8_gates([0.002, 0.002], projections, 0.009, 0.0201)
+    try:
+        reference.fp8_gates([float("nan"), 0.002], projections, 0.009, 0.019)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("nonfinite FP8 gate value accepted")
+    ones = torch.ones(1, 128, dtype=torch.bfloat16)
+    identity = torch.eye(128, dtype=torch.float64)
+    projection_weights = {name: identity for name in projections}
+    capture = lambda width: {"input": ones, "output": torch.ones(1, width, dtype=torch.bfloat16)}
+    segments = {0: [capture(384)], 2: [capture(128), capture(256), capture(128)]}
+    assert max(reference.frozen_projection_errors(0, segments, projection_weights).values()) == 0.0
+    segments[0][0]["output"][0, 0] = 1.25
+    changed = reference.frozen_projection_errors(0, segments, projection_weights)
+    assert changed["q"] > 0.003 and all(changed[name] == 0.0 for name in projections if name != "q")
     try:
         reference.dequantize_weight(raw, torch.full((2, 2), float("inf")), torch.float64)
     except ValueError:

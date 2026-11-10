@@ -8,7 +8,8 @@ from pathlib import Path
 assert os.environ.get("TORCH_DEVICE_BACKEND_AUTOLOAD") == "0"
 
 import torch
-from layer_fp64_audit import Weights, audit_legacy_bridge, frozen_layer_metrics, layer_step, rounded
+from layer_fp64_audit import (Weights, audit_legacy_bridge, frozen_layer_metrics,
+                              layer_attention_step, layer_post_attention_step, layer_step, rounded)
 
 
 def dequantize_weight(raw, scale, dtype):
@@ -82,6 +83,41 @@ def reference_gate_overlap(pure, same_boundary, pure_limit, boundary_limit):
             "gates_can_overlap": separation <= allowed}
 
 
+def fp8_gates(stage_errors, projection_errors, layer_bf16_pv_error, layer_fp64_probability_error):
+    if len(stage_errors) != 2 or len(projection_errors) != 7:
+        raise ValueError("FP8 layer audit requires both stages and all seven projections")
+    errors = (*stage_errors, *projection_errors.values(), layer_bf16_pv_error, layer_fp64_probability_error)
+    if not all(math.isfinite(value) and value >= 0 for value in errors):
+        raise ValueError("FP8 layer error is nonfinite or negative")
+    return (max(stage_errors) <= 0.003 and max(projection_errors.values()) <= 0.003 and
+            layer_bf16_pv_error <= 0.01 and layer_fp64_probability_error <= 0.02)
+
+
+def frozen_projection_errors(layer, segments, weights):
+    """Compare each exposed projection with OCP quantization of its captured input."""
+    before, after = segments[2 * layer], segments[2 * layer + 2]
+    if len(before) != (1 if layer == 0 else 4) or len(after) not in (3, 4):
+        raise ValueError("unexpected FP8 segment projection layout")
+    qkv, output, gate_up, down = before[-1], *after[:3]
+    errors = {}
+
+    def check(capture, names):
+        source = capture["input"].double()
+        actual = capture["output"].double()
+        sizes = [weights[name].shape[0] for name in names]
+        if actual.shape[-1] != sum(sizes):
+            raise ValueError("captured FP8 projection width does not match checkpoint weights")
+        for name, observed in zip(names, actual.split(sizes, dim=-1)):
+            reference = rounded(quantized_project(source, weights[name]), torch.float64)
+            errors[name] = row_error(observed, reference)
+
+    check(qkv, ("q", "k", "v"))
+    check(output, ("out",))
+    check(gate_up, ("gate", "up"))
+    check(down, ("down",))
+    return errors
+
+
 def main():
     audit_legacy_bridge()
     torch.set_num_threads(int(os.environ.get("GAUDIRT_CPU_THREADS", "8")))
@@ -99,6 +135,9 @@ def main():
     count = config["num_hidden_layers"]
     state = torch.load(os.environ["GAUDIRT_LAYER_CAPTURE_PATH"], map_location="cpu", weights_only=True)
     assert len(state["inputs"]) == count + 1 and len(state["attention"]) == count
+    segments = state.get("fp8_segments")
+    if not isinstance(segments, dict) or set(segments) != set(range(0, 2 * count + 1, 2)):
+        raise ValueError("capture requires GAUDIRT_CAPTURE_FP8_STAGES=1 for every layer")
     dim = config["head_dim"]
     geometry = (config["num_attention_heads"], config["num_key_value_heads"], dim,
                 torch.tensor(config["rms_norm_eps"], dtype=torch.float32).item(),
@@ -139,14 +178,29 @@ def main():
             unquantized = layer_step(x, w64, attention, geometry, torch.float64, same_boundary=True,
                                      project=unquantized_project)
             record = frozen_layer_metrics(i, actual, truth, same64, same32, same_pv64)
+            record["diagnostic_pure_formula_limit"] = record.pop("limit_pure")
             record["fp64_ocp_w8a8_l2"] = row_error(actual, same64)
             record["fp64_unquantized_activation_l2"] = row_error(actual, unquantized)
-            record["reference_gate_overlap"] = reference_gate_overlap(
-                truth, same_pv64, min(0.01, record["limit_pure"]), record["limit_same_boundary"])
-            record["pass"] = record["pass"] and record["fp64_ocp_w8a8_l2"] <= 0.02
+            record["reference_gate_overlap"] = reference_gate_overlap(truth, same_pv64, 0.01, 0.003)
+            stage1 = layer_attention_step(x, w64, attention, geometry, torch.float64,
+                                          same_boundary=True, project=quantized_project,
+                                          bf16_probability=True, bf16_pv_tile=pv_tile)
+            stage2 = layer_post_attention_step(x, attention["output"], w64, geometry, torch.float64,
+                                               same_boundary=True, project=quantized_project)
+            stage_errors = [row_error(attention["output"].double(), stage1), row_error(actual, stage2)]
+            projection_errors = frozen_projection_errors(i, segments, w64)
+            record.update({"stage_attention_l2": stage_errors[0], "stage_post_attention_l2": stage_errors[1],
+                           "frozen_projection_l2": projection_errors, "limit_stage": 0.003,
+                           "limit_projection": 0.003, "limit_same_boundary": 0.01,
+                           "limit_same_operators_fp64_probability": 0.02,
+                           "pure_reference_diagnostic_only": True})
+            record["pass"] = fp8_gates(stage_errors, projection_errors,
+                                       record["relative_l2_same_boundary"], record["fp64_ocp_w8a8_l2"])
             records.append(record)
             print("FROZEN_FP8_LAYER", json.dumps(record, sort_keys=True), flush=True)
-            rolling64 = layer_step(rolling64, w64, attention, geometry, torch.float64, project=pure_quantized_project)
+            rolling64 = layer_step(rolling64, w64, attention, geometry, torch.float64,
+                                   same_boundary=True, project=quantized_project,
+                                   bf16_probability=True, bf16_pv_tile=pv_tile)
             rolling32 = layer_step(rolling32, w32, attention, geometry, torch.float32, same_boundary=True,
                                    project=quantized_project)
             del w64, w32

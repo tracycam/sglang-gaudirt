@@ -31,6 +31,7 @@ decode_steps = int(os.environ.get("GAUDIRT_DECODE_STEPS", "128"))
 prefix_length = int(os.environ.get("GAUDIRT_FIXED_PREFIX_LENGTH", "136"))
 chunk_size = int(os.environ.get("GAUDIRT_AUDIT_CHUNK_SIZE", "-1"))
 cross_tree = os.environ.get("GAUDIRT_AUDIT_CROSS_TREE") == "1"
+capture_fp8_stages = os.environ.get("GAUDIRT_CAPTURE_FP8_STAGES") == "1"
 assert prefix_length > 0 and (chunk_size == -1 or chunk_size > 0) and decode_steps >= 0
 if cross_tree:
     assert chunk_size > 0 and os.environ.get("GAUDIRT_REPLAY_LAYER_CAPTURE_PATH"), (
@@ -50,11 +51,53 @@ for length in prompt_lengths:
     expected_steps += chunks(length) + decode_steps
     snapshot_steps.add(expected_steps)
 state = {"active": False, "complete": False, "inputs": [], "attention": [], "intermediates": [],
-         "replay_active": False, "replay_inputs": [], "replay_attention": [],
+         "fp8_segments": {},
+         "replay_active": False, "replay_inputs": [], "replay_attention": [], "replay_fp8_segments": {},
          "writes": [], "compile_deltas": [], "track_compile": False, "rows": 0, "bound_traced_steps": 0}
 original_backend = compiler.gaudirt_backend
 original_prepare = GaudiRTSRTPlatform.prepare_model_forward
 captures = 0
+
+
+def fp8_audit_segment(segment, index, last):
+    """Replay a stateless segment with projection boundaries exposed for audit."""
+    audit = copy.deepcopy(segment)
+    projections = [node for node in audit.graph.nodes if node.op == "call_function" and
+                   node.target in (torch.ops.gaudirt.block_fp8_linear,
+                                   torch.ops.gaudirt.block_fp8_linear.default)]
+    expected = 3 if last else 1 if index == 0 else 4
+    assert len(projections) == expected, (index, len(projections), audit.graph)
+    result = next(node for node in audit.graph.nodes if node.op == "output")
+    original = result.args[0]
+    original = tuple(original) if isinstance(original, (tuple, list)) else (original,)
+    extra = []
+    if last:
+        norms = [node for node in audit.graph.nodes if node.op == "call_function" and
+                 node.target == torch.ops.gaudirt.fused_add_rms_norm.default]
+        assert norms
+        with audit.graph.inserting_after(norms[-1]):
+            extra.append(audit.graph.call_function(operator.getitem, (norms[-1], 1)))
+    for node in projections:
+        extra.extend((node.args[0], node))
+    result.args = ((*original, *extra),)
+    audit.graph.lint()
+    return audit, len(original), len(projections)
+
+
+def capture_fp8_segment(index, original, audited, original_count, count, last=False):
+    expected = original if isinstance(original, (tuple, list)) else (original,)
+    assert len(expected) == original_count
+    for before, after in zip(expected, audited[:original_count]):
+        assert isinstance(before, torch.Tensor) and isinstance(after, torch.Tensor)
+        assert torch.equal(before.cpu().contiguous().view(torch.uint8),
+                           after.cpu().contiguous().view(torch.uint8)), (index, "audit replay changed segment output")
+    offset = original_count + int(last)
+    assert len(audited) == offset + 2 * count
+    target = "fp8_segments" if state["active"] else "replay_fp8_segments"
+    state[target][index] = [{"input": audited[offset + 2 * i][-1:].cpu(),
+                             "output": audited[offset + 2 * i + 1][-1:].cpu()}
+                            for i in range(count)]
+    return audited[original_count] if last else None
 
 
 def audit_backend(graph, inputs):
@@ -116,7 +159,13 @@ def audit_backend(graph, inputs):
 
             segment.forward = paged
         elif index < len(segments) - 1:
-            def layer_input(*args, previous=previous, index=index):
+            audit_segment, original_count, projection_count = (
+                fp8_audit_segment(segment, index, False) if capture_fp8_stages else (None, 0, 0))
+            audit_compiled = []
+
+            def layer_input(*args, previous=previous, index=index, audit_segment=audit_segment,
+                            audit_compiled=audit_compiled, original_count=original_count,
+                            projection_count=projection_count):
                 output = previous(*args)
                 if state["track_compile"]:
                     delta = compiled.__self__.trace_compile_delta(index)
@@ -125,30 +174,45 @@ def audit_backend(graph, inputs):
                         assert delta == 0, (state["rows"], index, delta)
                 if state["active"]:
                     state["inputs"].append(output[3].cpu())
+                if audit_segment is not None and (state["active"] or state["replay_active"]):
+                    if not audit_compiled:
+                        audit_compiled.append(compiler._program_backend(audit_segment, args))
+                    capture_fp8_segment(index, output, audit_compiled[0](*args),
+                                        original_count, projection_count)
                 if state["replay_active"]:
                     state["replay_inputs"].append(output[3][-1:].cpu())
                 return output
 
             segment.forward = layer_input
         else:
-            audit_segment = copy.deepcopy(segment)
-            norms = [node for node in audit_segment.graph.nodes if node.op == "call_function" and
-                     node.target == torch.ops.gaudirt.fused_add_rms_norm.default]
-            assert norms
-            with audit_segment.graph.inserting_after(norms[-1]):
-                last_residual = audit_segment.graph.call_function(operator.getitem, (norms[-1], 1))
-            result = next(node for node in audit_segment.graph.nodes if node.op == "output")
-            result.args = ((result.args[0], last_residual),)
-            audit_segment.graph.lint()
+            if capture_fp8_stages:
+                audit_segment, original_count, projection_count = fp8_audit_segment(segment, index, True)
+            else:
+                audit_segment = copy.deepcopy(segment)
+                norms = [node for node in audit_segment.graph.nodes if node.op == "call_function" and
+                         node.target == torch.ops.gaudirt.fused_add_rms_norm.default]
+                assert norms
+                with audit_segment.graph.inserting_after(norms[-1]):
+                    last_residual = audit_segment.graph.call_function(operator.getitem, (norms[-1], 1))
+                result = next(node for node in audit_segment.graph.nodes if node.op == "output")
+                result.args = ((result.args[0], last_residual),)
+                audit_segment.graph.lint()
+                original_count, projection_count = 0, 0
             audit_compiled = []
 
-            def last_layer(*args, previous=previous, audit_segment=audit_segment, audit_compiled=audit_compiled):
+            def last_layer(*args, previous=previous, audit_segment=audit_segment, audit_compiled=audit_compiled,
+                           index=index, original_count=original_count, projection_count=projection_count):
                 output = previous(*args)
                 if state["active"] or state["replay_active"]:
                     if not audit_compiled:
                         audit_compiled.append(compiler._program_backend(audit_segment, args))
-                    audited, residual = audit_compiled[0](*args)
-                    assert torch.equal(output.cpu().view(torch.uint8), audited.cpu().view(torch.uint8))
+                    audited = audit_compiled[0](*args)
+                    if capture_fp8_stages:
+                        residual = capture_fp8_segment(index, output, audited, original_count,
+                                                       projection_count, last=True)
+                    else:
+                        replayed, residual = audited
+                        assert torch.equal(output.cpu().view(torch.uint8), replayed.cpu().view(torch.uint8))
                     if state["active"]:
                         state["inputs"].append(residual.cpu())
                     else:
@@ -233,7 +297,8 @@ def audit_prepare(self, forward):
                 assert len(state["replay_attention"]) == len(state["attention"]) == layers
                 if cross_tree:
                     torch.save({"inputs": state["replay_inputs"], "attention": state["replay_attention"],
-                                "intermediates": [], "logits": logits},
+                                "intermediates": [], "fp8_segments": state["replay_fp8_segments"],
+                                "logits": logits},
                                os.environ["GAUDIRT_REPLAY_LAYER_CAPTURE_PATH"])
                 else:
                     assert torch.equal(other, single_logits), (relative, maximum)
@@ -255,7 +320,8 @@ def audit_prepare(self, forward):
         if state["active"]:
             assert len(state["inputs"]) == layers + 1 and len(state["attention"]) == layers
             capture = {"inputs": state["inputs"], "attention": state["attention"],
-                       "intermediates": state["intermediates"], "logits": logits}
+                       "intermediates": state["intermediates"], "fp8_segments": state["fp8_segments"],
+                       "logits": logits}
             torch.save(capture, os.environ["GAUDIRT_LAYER_CAPTURE_PATH"])
             state["complete"] = True
         state["active"] = False

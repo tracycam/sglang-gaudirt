@@ -63,11 +63,15 @@ fault test for the state audit runs with
 `python tests/acceptance/test_phase5a_state_audit.py`.
 
 For a block-FP8 checkpoint, install the matching kernel Python package as well
-as the plugin's `fp8` extra. Use `fp8_layer_fp64_audit.py` in place of the BF16
-layer audit. It computes the main W8A8 reference from the original checkpoint
-codes and scales and standard OCP activation quantization; it separately
-reports the distance from unquantized BF16 activations. A failed layer or KL
-check exits nonzero and retains the receipt. Run
+as the plugin's `fp8` extra. Set `GAUDIRT_CAPTURE_FP8_STAGES=1` for the state
+capture, then use `fp8_layer_fp64_audit.py` in place of the BF16 layer audit.
+The capture exposes each projection's input and output in a stateless replay
+and verifies the original segment output is byte-identical. The audit checks
+each frozen projection and both frozen layer stages against original OCP
+weights and standard W8A8 activations, as well as the full-layer same-boundary
+and conditioned KL gates. Pure FP64 and unquantized BF16 activation distances
+are separate diagnostics. A failed layer or KL check exits nonzero and retains
+the receipt. Run
 `python tests/acceptance/test_fp8_layer_reference.py` for the CPU reference
 contract before auditing a capture.
 
