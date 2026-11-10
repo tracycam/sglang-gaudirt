@@ -110,6 +110,12 @@ class GaudiRTSRTPlatform(SRTPlatform):
 
         return decode_positions(seq_lens_cpu, device)
 
+    def gather_scheduler_values(self, buffer, indices):
+        return torch.ops.gaudirt._index_select_validated(buffer, 0, indices)
+
+    def store_scheduler_values(self, buffer, indices, values):
+        torch.ops.gaudirt._index_put_validated_(buffer, indices, values.to(buffer.dtype))
+
     def defer_eager_decode_positions(self) -> bool:
         return True
 
