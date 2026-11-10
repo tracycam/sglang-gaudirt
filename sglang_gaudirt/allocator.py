@@ -26,12 +26,15 @@ class GaudiRTTokenToKVPoolAllocator(TokenToKVPoolAllocator):
             # The request table and attention metadata store 32-bit slot IDs.
             # Keep the allocator in that same representation so every decode
             # write does not require a separate device cast.
-            self.free_pages = torch.arange(1, self.size + 1, dtype=torch.int32, device=self.device)
+            self.free_pages = torch.arange(1, self.size + 1, dtype=torch.int32).to(self.device)
             self.release_pages = torch.empty((0,), dtype=torch.int32, device=self.device)
             self.is_not_in_free_group = True
             self.free_group = []
             return
-        self.free_pages = torch.arange(1, self.num_pages + 1, dtype=torch.int64, device=self.device)
+        # This is scheduler metadata constructed on reset, not model data.
+        # Preparing it on the host avoids a shape-specific device recipe when
+        # the configured pool capacity changes between processes.
+        self.free_pages = torch.arange(1, self.num_pages + 1, dtype=torch.int64).to(self.device)
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
         self.is_not_in_free_group = True
         self.free_group = []
