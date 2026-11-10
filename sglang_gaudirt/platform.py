@@ -116,8 +116,14 @@ class GaudiRTSRTPlatform(SRTPlatform):
     def store_scheduler_values(self, buffer, indices, values):
         torch.ops.gaudirt._index_put_validated_(buffer, indices, values.to(buffer.dtype))
 
+    def advance_decode_lengths(self, seq_lens, orig_seq_lens):
+        return torch.ops.gaudirt._advance_decode_lengths(seq_lens, orig_seq_lens)
+
     def defer_eager_decode_positions(self) -> bool:
         return True
+
+    def copy_eager_inputs(self) -> bool:
+        return False
 
     def prepare_extend_positions(self, prefix_lens_cpu, seq_lens_cpu, total, device):
         from .positions import extend_positions
