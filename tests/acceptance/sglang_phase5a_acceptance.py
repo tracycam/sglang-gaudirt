@@ -34,8 +34,8 @@ cross_tree = os.environ.get("GAUDIRT_AUDIT_CROSS_TREE") == "1"
 capture_fp8_stages = os.environ.get("GAUDIRT_CAPTURE_FP8_STAGES") == "1"
 assert prefix_length > 0 and (chunk_size == -1 or chunk_size > 0) and decode_steps >= 0
 if cross_tree:
-    assert chunk_size > 0 and os.environ.get("GAUDIRT_REPLAY_LAYER_CAPTURE_PATH"), (
-        "cross-tree validation requires chunking and a separate replay capture")
+    assert (chunk_size > 0 or prefix_length + 1 >= 512) and os.environ.get("GAUDIRT_REPLAY_LAYER_CAPTURE_PATH"), (
+        "cross-tree validation requires chunking or a prefill-bucket replay and a separate replay capture")
 
 
 def chunks(length):
