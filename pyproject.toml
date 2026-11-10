@@ -8,5 +8,8 @@ version = "0.1.0"
 description = "SGLang platform integration for GaudiRT"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+fp8 = ["gaudi-llm-kernels>=0.3.0.dev1"]
+
 [project.entry-points."sglang.srt.platforms"]
 gaudirt = "sglang_gaudirt:activate"
