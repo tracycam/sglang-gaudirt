@@ -26,8 +26,9 @@ def ocp_activation(value, dtype):
     # BF16 rounding so that the CPU reference does not double-round.
     bf16 = rounded(value, dtype)
     group = bf16.float().reshape(-1, value.shape[-1] // 128, 128)
-    scale = group.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448.0
-    quantized = (group / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    scale = group.abs().amax(-1, keepdim=True) / 448.0
+    denominator = torch.where(scale == 0, 1.0, scale)
+    quantized = (group / denominator).clamp(-448, 448).to(torch.float8_e4m3fn)
     return (quantized.to(dtype) * scale.to(dtype)).reshape(value.shape)
 
 
@@ -42,8 +43,9 @@ def pure_quantized_project(value, weight):
     if value.dtype != torch.float64 or value.shape[-1] % 128 or not torch.isfinite(value).all():
         raise ValueError("pure FP8 reference requires finite FP64 inputs with aligned width")
     group = value.reshape(-1, value.shape[-1] // 128, 128)
-    scale = group.abs().amax(-1, keepdim=True).float().clamp_min(1e-10) / 448.0
-    magnitude = (group / scale.double()).abs().clamp_max(448.0).contiguous()
+    scale = group.abs().amax(-1, keepdim=True).float() / 448.0
+    denominator = torch.where(scale == 0, 1.0, scale)
+    magnitude = (group / denominator.double()).abs().clamp_max(448.0).contiguous()
     levels = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).double()
     upper = torch.searchsorted(levels, magnitude).clamp(1, 126)
     lower = upper - 1

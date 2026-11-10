@@ -21,9 +21,11 @@ def main():
 
     value = torch.randn(3, 256, generator=generator).to(torch.bfloat16).double()
     value[0].zero_()
+    value[1, :128] = (value[1, :128] * 1e-15).to(torch.bfloat16).double()
     group = value.float().reshape(3, 2, 128)
-    activation_scale = group.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448.0
-    quantized = (group / activation_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    activation_scale = group.abs().amax(-1, keepdim=True) / 448.0
+    denominator = torch.where(activation_scale == 0, 1.0, activation_scale)
+    quantized = (group / denominator).clamp(-448, 448).to(torch.float8_e4m3fn)
     expected_activation = (quantized.double() * activation_scale.double()).reshape(3, 256)
     assert torch.equal(reference.ocp_activation(value, torch.float64), expected_activation)
     assert torch.equal(reference.quantized_project(value, weight), expected_activation @ expected_weight.t())

@@ -68,8 +68,8 @@ def main():
     x_cpu = torch.randn(17, k).to(torch.bfloat16)
     output = compiled(x_cpu.to("gaudirt:0"), layer.weight, layer.weight_scale).cpu().double()
     grouped = x_cpu.float().reshape(17, k // 128, 128)
-    scale = grouped.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448.0
-    q = (grouped / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    scale = grouped.abs().amax(-1, keepdim=True) / 448.0
+    q = (grouped / torch.where(scale == 0, 1.0, scale)).clamp(-448, 448).to(torch.float8_e4m3fn)
     ref_x = (q.double() * scale.double()).reshape(17, k)
     ref_w = (original.double().reshape(n // 128, 128, k // 128, 128) *
              original_scale.double().reshape(n // 128, 1, k // 128, 1)).reshape(n, k)
@@ -101,8 +101,8 @@ def main():
         assert torch.equal(channel_layer.weight.cpu().view(torch.uint8), channel_weight.view(torch.uint8))
         assert torch.equal(channel_layer.weight_scale.cpu(), channel_scale)
         output = channel_scheme.apply_weights(channel_layer, x_cpu.to("gaudirt:0")).cpu().double()
-        token_scale = x_cpu.float().abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448.0
-        token_q = (x_cpu.float() / token_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        token_scale = x_cpu.float().abs().amax(-1, keepdim=True) / 448.0
+        token_q = (x_cpu.float() / torch.where(token_scale == 0, 1.0, token_scale)).clamp(-448, 448).to(torch.float8_e4m3fn)
         channel_ref_w = original.double() * expanded_scale.double().unsqueeze(1)
         channel_ref = (token_q.double() * token_scale.double()) @ channel_ref_w.T
         channel_unquantized = x_cpu.double() @ channel_ref_w.T
