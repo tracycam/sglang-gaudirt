@@ -27,6 +27,38 @@ class GaudiRTSRTPlatform(SRTPlatform):
     def get_dispatch_key_name(self):
         return "gaudirt"
 
+    def supports_fp8(self):
+        return True
+
+    def supports_compressed_w8a8_fp8(self, weight_quant, input_quant):
+        from compressed_tensors.quantization import QuantizationStrategy, QuantizationType
+
+        return bool(
+            weight_quant is not None and input_quant is not None and
+            weight_quant.type == input_quant.type == QuantizationType.FLOAT and
+            weight_quant.num_bits == input_quant.num_bits == 8 and
+            weight_quant.symmetric and not weight_quant.dynamic and
+            weight_quant.strategy == QuantizationStrategy.BLOCK and
+            tuple(weight_quant.block_structure or ()) == (128, 128) and
+            input_quant.strategy == QuantizationStrategy.GROUP and input_quant.group_size == 128 and
+            input_quant.dynamic and input_quant.symmetric
+        )
+
+    def prepare_w8a8_fp8_weight(self, layer, strategy, scale_name):
+        from compressed_tensors.quantization import QuantizationStrategy
+
+        if strategy != QuantizationStrategy.BLOCK:
+            raise NotImplementedError("GaudiRT FP8: weight strategy is not implemented")
+        from .fp8 import prepare_block_weight
+
+        prepare_block_weight(layer, scale_name)
+        return True
+
+    def get_w8a8_block_fp8_linear(self):
+        from .fp8 import block_fp8_linear
+
+        return block_fp8_linear
+
     def get_default_attention_backend(self):
         return "gaudirt"
 
