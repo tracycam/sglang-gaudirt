@@ -9,54 +9,6 @@ import gaudirt
 from sglang.srt.platforms.interface import PlatformEnum, SRTPlatform
 
 
-def _install_graceful_worker_shutdown():
-    import zmq
-    from sglang.srt.entrypoints.engine import Engine
-    from sglang.srt.managers.io_struct import ShutdownReq, sock_send
-    from sglang.srt.utils.network import get_zmq_socket
-
-    def _shutdown_workers_gracefully(self):
-        watchdog = self.tokenizer_manager._subprocess_watchdog
-        workers = dict(zip(watchdog._names, watchdog._processes))
-        tp_size = int(getattr(self.server_args, "tp_size", 1))
-        sched_names = [f"scheduler_{i}" for i in range(tp_size)]
-        expected = set(sched_names) | {"detokenizer"}
-        if set(workers) != expected:
-            raise RuntimeError(
-                f"graceful engine shutdown expected {sorted(expected)}, got {sorted(workers)}"
-            )
-
-        def wait_for(name):
-            worker = workers[name]
-            worker.join(timeout=60)
-            if worker.is_alive() or worker.exitcode != 0:
-                raise RuntimeError(f"{name} did not exit cleanly: {worker.exitcode}")
-
-        context = None
-        socket = None
-        try:
-            self.tokenizer_manager._dispatch_to_scheduler(ShutdownReq())
-            for name in sched_names:
-                wait_for(name)
-            context = zmq.Context()
-            socket = get_zmq_socket(context, zmq.PUSH, self.port_args.detokenizer_ipc_name, False)
-            sock_send(socket, ShutdownReq())
-            wait_for("detokenizer")
-        except Exception:
-            for worker in workers.values():
-                if worker.is_alive():
-                    worker.terminate()
-                    worker.join(timeout=5)
-            raise
-        finally:
-            if socket is not None:
-                socket.close(linger=0)
-            if context is not None:
-                context.term()
-
-    Engine._shutdown_workers_gracefully = _shutdown_workers_gracefully
-
-
 def _hbm_budget():
     value = int(os.environ.get("GAUDIRT_HBM_BYTES", str(80 * 1024**3)))
     if value <= 0:
@@ -189,18 +141,10 @@ class GaudiRTSRTPlatform(SRTPlatform):
         from gaudirt.compiler import compile
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
-        model = getattr(forward, "__self__", None)
-        if isinstance(model, torch.nn.Module):
-            for mod in model.modules():
-                gatherer = getattr(mod, "_logits_gatherer", None)
-                if gatherer is not None and getattr(gatherer, "_state", None) is getattr(gatherer, "_UNINIT", object()):
-                    gatherer._state = None
-
         return compile(forward, dynamic_arg_indices=(0, 1),
                        prepare_capture=lambda: get_attn_backend().mark_capture_inputs())
 
     def requires_graceful_worker_shutdown(self):
-        _install_graceful_worker_shutdown()
         return True
 
     def write_req_to_token_pool(
@@ -302,5 +246,4 @@ class GaudiRTSRTPlatform(SRTPlatform):
         register_attention_backend("gaudirt")(GaudiRTPagedAttnBackend)
         add_attention_backend_choices(["gaudirt"])
         register_ops()
-        _install_graceful_worker_shutdown()
         self._registered = True
