@@ -1,4 +1,4 @@
-"""Single-device SGLang platform backed by GaudiRT."""
+"""Multi-device SGLang platform backed by GaudiRT."""
 
 import os
 from contextlib import contextmanager
@@ -7,6 +7,54 @@ import torch
 import gaudirt
 
 from sglang.srt.platforms.interface import PlatformEnum, SRTPlatform
+
+
+def _install_graceful_worker_shutdown():
+    import zmq
+    from sglang.srt.entrypoints.engine import Engine
+    from sglang.srt.managers.io_struct import ShutdownReq, sock_send
+    from sglang.srt.utils.network import get_zmq_socket
+
+    def _shutdown_workers_gracefully(self):
+        watchdog = self.tokenizer_manager._subprocess_watchdog
+        workers = dict(zip(watchdog._names, watchdog._processes))
+        tp_size = int(getattr(self.server_args, "tp_size", 1))
+        sched_names = [f"scheduler_{i}" for i in range(tp_size)]
+        expected = set(sched_names) | {"detokenizer"}
+        if set(workers) != expected:
+            raise RuntimeError(
+                f"graceful engine shutdown expected {sorted(expected)}, got {sorted(workers)}"
+            )
+
+        def wait_for(name):
+            worker = workers[name]
+            worker.join(timeout=60)
+            if worker.is_alive() or worker.exitcode != 0:
+                raise RuntimeError(f"{name} did not exit cleanly: {worker.exitcode}")
+
+        context = None
+        socket = None
+        try:
+            self.tokenizer_manager._dispatch_to_scheduler(ShutdownReq())
+            for name in sched_names:
+                wait_for(name)
+            context = zmq.Context()
+            socket = get_zmq_socket(context, zmq.PUSH, self.port_args.detokenizer_ipc_name, False)
+            sock_send(socket, ShutdownReq())
+            wait_for("detokenizer")
+        except Exception:
+            for worker in workers.values():
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+            raise
+        finally:
+            if socket is not None:
+                socket.close(linger=0)
+            if context is not None:
+                context.term()
+
+    Engine._shutdown_workers_gracefully = _shutdown_workers_gracefully
 
 
 def _hbm_budget():
@@ -25,6 +73,9 @@ class GaudiRTSRTPlatform(SRTPlatform):
         self._registered = False
 
     def get_dispatch_key_name(self):
+        return "gaudirt"
+
+    def get_torch_distributed_backend_str(self) -> str:
         return "gaudirt"
 
     def supports_fp8(self):
@@ -93,16 +144,25 @@ class GaudiRTSRTPlatform(SRTPlatform):
         return backend.last_token_indices
 
     def apply_server_args_defaults(self, server_args):
+        if server_args.tp_size not in (1, 2, 4, 8):
+            raise ValueError("GaudiRT supports tensor parallel sizes 1, 2, 4, and 8")
+        if server_args.tp_size > gaudirt.device_count():
+            raise ValueError(
+                f"GaudiRT tp_size={server_args.tp_size} exceeds visible devices ({gaudirt.device_count()})"
+            )
         if any(getattr(server_args, name) != 1 for name in (
-            "tp_size", "pp_size", "dp_size", "nnodes",
+            "pp_size", "dp_size", "nnodes",
             "tokenizer_worker_num", "detokenizer_worker_num",
         )):
-            raise ValueError("GaudiRT currently requires one device and one tokenizer/detokenizer worker")
+            raise ValueError("GaudiRT currently requires pp=dp=nnodes=1 and one tokenizer/detokenizer worker")
         if server_args.page_size not in (None, 1, 16, 64):
             raise ValueError("GaudiRT supports KV page sizes 1, 16, and 64")
         if server_args.page_size is None:
             server_args.page_size = 1
         server_args.disable_cuda_graph = True
+        server_args.disable_custom_all_reduce = True
+        if hasattr(server_args, "pre_warm_nccl"):
+            server_args.pre_warm_nccl = False
 
     @contextmanager
     def rope_cache_initialization_context(self):
@@ -129,10 +189,18 @@ class GaudiRTSRTPlatform(SRTPlatform):
         from gaudirt.compiler import compile
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
+        model = getattr(forward, "__self__", None)
+        if isinstance(model, torch.nn.Module):
+            for mod in model.modules():
+                gatherer = getattr(mod, "_logits_gatherer", None)
+                if gatherer is not None and getattr(gatherer, "_state", None) is getattr(gatherer, "_UNINIT", object()):
+                    gatherer._state = None
+
         return compile(forward, dynamic_arg_indices=(0, 1),
                        prepare_capture=lambda: get_attn_backend().mark_capture_inputs())
 
     def requires_graceful_worker_shutdown(self):
+        _install_graceful_worker_shutdown()
         return True
 
     def write_req_to_token_pool(
@@ -177,30 +245,39 @@ class GaudiRTSRTPlatform(SRTPlatform):
         return extend_positions(prefix_lens_cpu, seq_lens_cpu, total, device)
 
     def get_device_total_memory(self, device_id=0):
-        if device_id != 0:
-            raise ValueError("GaudiRT supports device 0 only")
-        return gaudirt.mem_get_info()[1] if gaudirt.is_initialized() else _hbm_budget()
+        idx = gaudirt._resolve_device_index(device_id)
+        if gaudirt.is_initialized() and idx == gaudirt.current_device():
+            return gaudirt.mem_get_info(idx)[1]
+        return _hbm_budget()
 
     def get_current_memory_usage(self, device=None):
-        if device not in (None, 0, "gaudirt:0", torch.device("gaudirt:0")):
-            raise ValueError("GaudiRT supports device 0 only")
-        return float(gaudirt.memory_allocated()) if gaudirt.is_initialized() else 0.0
+        idx = gaudirt._resolve_device_index(device)
+        if gaudirt.is_initialized() and idx == gaudirt.current_device():
+            return float(gaudirt.memory_allocated(idx))
+        return 0.0
 
     def get_available_memory(self, device_id=0):
-        if device_id != 0:
-            raise ValueError("GaudiRT supports device 0 only")
-        return gaudirt.mem_get_info() if gaudirt.is_initialized() else (_hbm_budget(), _hbm_budget())
+        idx = gaudirt._resolve_device_index(device_id)
+        if gaudirt.is_initialized() and idx == gaudirt.current_device():
+            return gaudirt.mem_get_info(idx)
+        return (_hbm_budget(), _hbm_budget())
 
     def get_device(self, device_id=None):
-        if device_id not in (None, 0):
-            raise ValueError("GaudiRT supports device 0 only")
-        return "gaudirt" if device_id is None else "gaudirt:0"
+        if device_id is None:
+            return "gaudirt"
+        idx = gaudirt._resolve_device_index(device_id)
+        return f"gaudirt:{idx}"
+
+    def set_device(self, device):
+        gaudirt.set_device(device)
 
     def empty_cache(self):
-        gaudirt.empty_cache()
+        if gaudirt.is_initialized():
+            gaudirt.empty_cache()
 
     def synchronize(self):
-        gaudirt.synchronize()
+        if gaudirt.is_initialized():
+            gaudirt.synchronize()
 
     def get_mha_kv_pool_cls(self):
         from .kv_pool import GaudiRTMHATokenToKVPool
@@ -215,8 +292,7 @@ class GaudiRTSRTPlatform(SRTPlatform):
     def init_backend(self):
         if self._registered:
             return
-        if not gaudirt.is_initialized():
-            gaudirt.initialize(hbm_bytes=_hbm_budget())
+        gaudirt.configure_default_runtime(hbm_bytes=_hbm_budget())
 
         from sglang.srt.layers.attention.attention_registry import register_attention_backend
         from sglang.srt.server_args import add_attention_backend_choices
@@ -226,4 +302,5 @@ class GaudiRTSRTPlatform(SRTPlatform):
         register_attention_backend("gaudirt")(GaudiRTPagedAttnBackend)
         add_attention_backend_choices(["gaudirt"])
         register_ops()
+        _install_graceful_worker_shutdown()
         self._registered = True

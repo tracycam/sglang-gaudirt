@@ -18,10 +18,11 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
             raise ValueError("GaudiRT attention requires its head-major MHA KV pool")
         if pool.dtype != torch.bfloat16 or pool.v_head_dim != pool.head_dim:
             raise ValueError("GaudiRT attention requires matching BF16 K/V heads")
-        if model_runner.ps.tp_size != 1:
-            raise ValueError("GaudiRT attention currently supports tensor parallel size 1")
-        self.query_heads = model_runner.model_config.num_attention_heads
-        if self.query_heads % pool.head_num:
+        tp_size = model_runner.ps.tp_size
+        if tp_size not in (1, 2, 4, 8):
+            raise ValueError("GaudiRT attention supports tensor parallel sizes 1, 2, 4, and 8")
+        self.query_heads = model_runner.model_config.get_num_attention_heads(tp_size)
+        if self.query_heads <= 0 or self.query_heads % pool.head_num:
             raise ValueError("GaudiRT attention requires an integral GQA head ratio")
         self.vocabulary = model_runner.model_config.vocab_size
         if not isinstance(self.vocabulary, int) or self.vocabulary <= 0:
