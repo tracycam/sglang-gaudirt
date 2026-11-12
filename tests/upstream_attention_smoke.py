@@ -13,7 +13,7 @@ assert "habana_frameworks" not in sys.modules
 import torch
 from fp64_reference import direct_bf16
 import paged_attention_smoke as attention_ref
-from paged_attention_reference import isolated_errors, tiled_bf16_pv
+from paged_attention_reference import direct_bf16_pv, isolated_errors, tiled_bf16_pv
 import rotary_runtime_smoke as rotary_ref
 import gaudirt
 from sglang.srt.platforms import current_platform
@@ -70,7 +70,8 @@ def main():
     req_pool.req_to_token.copy_(mapping)
     runner = SimpleNamespace(req_to_token_pool=req_pool, token_to_kv_pool=pool,
                              ps=SimpleNamespace(tp_size=1),
-                             model_config=SimpleNamespace(vocab_size=32000, num_attention_heads=HEADS))
+                             model_config=SimpleNamespace(vocab_size=32000, num_attention_heads=HEADS,
+                                                          get_num_attention_heads=lambda tp: HEADS // tp))
     backend = GaudiRTPagedAttnBackend(runner)
     layers = [RadixAttention(HEADS, DIM, SCALE, KV_HEADS, layer_id=i) for i in range(2)]
     rope = RotaryEmbedding(DIM, DIM, CONTEXT, 10000, True, torch.bfloat16)
@@ -125,7 +126,8 @@ def main():
                 req_pool_indices=torch.tensor([1, 3], dtype=torch.int64, device="gaudirt:0"),
                 seq_lens=seq_lens_cpu.to("gaudirt:0"), out_cache_loc=locations.to("gaudirt:0"),
                 seq_lens_sum=int(seq_lens_cpu.sum()), seq_lens_cpu=seq_lens_cpu,
-                positions=positions, extend_prefix_lens_cpu=prefixes, extend_seq_lens_cpu=lengths,
+                positions=positions if step == 0 else positions_cpu,
+                extend_prefix_lens_cpu=prefixes, extend_seq_lens_cpu=lengths,
             )
             backend.init_forward_metadata(batch)
             assert batch.input_ids.shape == (len(positions_cpu),)
@@ -137,7 +139,7 @@ def main():
             v_cpu = torch.randn((len(positions_cpu), KV_WIDTH), dtype=torch.bfloat16)
             with forward_context(ForwardContext(backend)):
                 assert current_platform.get_last_token_indices() is backend.last_token_indices
-                q_rot, k_rot = rope(positions, q_cpu.to("gaudirt:0"), k_cpu.to("gaudirt:0"))
+                q_rot, k_rot = rope(batch.positions, q_cpu.to("gaudirt:0"), k_cpu.to("gaudirt:0"))
                 cache_cpu = rope.cos_sin_cache.cpu()
                 assert torch.equal(cache_cpu.view(torch.int16), initial_cache.view(torch.int16)), \
                     "RoPE table changed while moving to the device"
@@ -168,9 +170,13 @@ def main():
                     # the isolated attention gate uses the same single-tile
                     # BF16-PV arithmetic as the device, independently of the
                     # pure FP32 reference for full decoder layers.
-                    pv = tiled_bf16_pv(q_rot_cpu, expected_k, expected_v, row_requests,
-                                       positions_cpu, mapping, HEADS, KV_HEADS, DIM,
-                                       attention_ref.SCALE_FP32, 512)
+                    pv = (tiled_bf16_pv(q_rot_cpu, expected_k, expected_v, row_requests,
+                                        positions_cpu, mapping, HEADS, KV_HEADS, DIM,
+                                        attention_ref.SCALE_FP32, 512)
+                          if step == 0 and total > 512 else
+                          direct_bf16_pv(q_rot_cpu, expected_k, expected_v, row_requests,
+                                         positions_cpu, mapping, HEADS, KV_HEADS, DIM,
+                                         attention_ref.SCALE_FP32))
                     output_cpu = output.cpu().double()
                     error, pv_error = isolated_errors(output_cpu, r64, pv)
                     denom = torch.linalg.vector_norm(r64, dim=-1).clamp_min(1e-30)

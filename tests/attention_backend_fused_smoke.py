@@ -41,7 +41,8 @@ def main():
     req_pool.req_to_token.copy_(mapping)
     runner = SimpleNamespace(req_to_token_pool=req_pool, token_to_kv_pool=pool,
                              ps=SimpleNamespace(tp_size=1),
-                             model_config=SimpleNamespace(vocab_size=32000, num_attention_heads=heads))
+                             model_config=SimpleNamespace(vocab_size=32000, num_attention_heads=heads,
+                                                          get_num_attention_heads=lambda tp: heads // tp))
     backend = GaudiRTPagedAttnBackend(runner)
     positions = torch.arange(prefix, prefix + rows, dtype=torch.int64)
     locations = mapping[1, positions].long()
