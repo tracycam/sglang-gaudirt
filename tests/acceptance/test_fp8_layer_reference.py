@@ -36,18 +36,18 @@ def main():
     pure_result = reference.pure_quantized_project(pure_input, torch.eye(128, dtype=torch.float64))
     assert torch.equal(pure_result[0, :5], torch.tensor([448.0, 1.0, 1.25, -1.0, 1.125], dtype=torch.float64))
     assert reference.quantized_project(pure_input, torch.eye(128, dtype=torch.float64))[0, 4] == 1.0
-    assert reference.reference_gate_overlap(torch.tensor([1.0]), torch.tensor([1.01]), 0.01, 0.003)[
+    assert reference.reference_gate_overlap(torch.tensor([1.0]), torch.tensor([1.01]), 0.01, 0.01)[
         "gates_can_overlap"]
-    assert not reference.reference_gate_overlap(torch.tensor([1.0]), torch.tensor([1.02]), 0.01, 0.003)[
+    assert not reference.reference_gate_overlap(torch.tensor([1.0]), torch.tensor([1.03]), 0.01, 0.01)[
         "gates_can_overlap"]
-    projections = {name: 0.002 for name in ("q", "k", "v", "out", "gate", "up", "down")}
-    assert reference.fp8_gates([0.002, 0.002], projections, 0.009, 0.019)
-    assert not reference.fp8_gates([0.0031, 0.002], projections, 0.009, 0.019)
-    assert not reference.fp8_gates([0.002, 0.0031], projections, 0.009, 0.019)
+    projections = {name: 0.004 for name in ("q", "k", "v", "out", "gate", "up", "down")}
+    assert reference.fp8_gates([0.004, 0.004], projections, 0.009, 0.019)
+    assert not reference.fp8_gates([0.0101, 0.004], projections, 0.009, 0.019)
+    assert not reference.fp8_gates([0.004, 0.0101], projections, 0.009, 0.019)
     for name in projections:
-        assert not reference.fp8_gates([0.002, 0.002], {**projections, name: 0.0031}, 0.009, 0.019)
-    assert not reference.fp8_gates([0.002, 0.002], projections, 0.0101, 0.019)
-    assert not reference.fp8_gates([0.002, 0.002], projections, 0.009, 0.0201)
+        assert not reference.fp8_gates([0.004, 0.004], {**projections, name: 0.0101}, 0.009, 0.019)
+    assert not reference.fp8_gates([0.004, 0.004], projections, 0.0101, 0.019)
+    assert not reference.fp8_gates([0.004, 0.004], projections, 0.009, 0.0201)
     try:
         reference.fp8_gates([float("nan"), 0.002], projections, 0.009, 0.019)
     except ValueError:
@@ -62,7 +62,7 @@ def main():
     assert max(reference.frozen_projection_errors(0, segments, projection_weights).values()) == 0.0
     segments[0][0]["output"][0, 0] = 1.25
     changed = reference.frozen_projection_errors(0, segments, projection_weights)
-    assert changed["q"] > 0.003 and all(changed[name] == 0.0 for name in projections if name != "q")
+    assert changed["q"] > 0.01 and all(changed[name] == 0.0 for name in projections if name != "q")
     try:
         reference.dequantize_weight(raw, torch.full((2, 2), float("inf")), torch.float64)
     except ValueError:

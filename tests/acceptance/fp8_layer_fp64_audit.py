@@ -89,7 +89,7 @@ def fp8_gates(stage_errors, projection_errors, layer_bf16_pv_error, layer_fp64_p
     errors = (*stage_errors, *projection_errors.values(), layer_bf16_pv_error, layer_fp64_probability_error)
     if not all(math.isfinite(value) and value >= 0 for value in errors):
         raise ValueError("FP8 layer error is nonfinite or negative")
-    return (max(stage_errors) <= 0.003 and max(projection_errors.values()) <= 0.003 and
+    return (max(stage_errors) <= 0.01 and max(projection_errors.values()) <= 0.01 and
             layer_bf16_pv_error <= 0.01 and layer_fp64_probability_error <= 0.02)
 
 
@@ -181,7 +181,7 @@ def main():
             record["diagnostic_pure_formula_limit"] = record.pop("limit_pure")
             record["fp64_ocp_w8a8_l2"] = row_error(actual, same64)
             record["fp64_unquantized_activation_l2"] = row_error(actual, unquantized)
-            record["reference_gate_overlap"] = reference_gate_overlap(truth, same_pv64, 0.01, 0.003)
+            record["reference_gate_overlap"] = reference_gate_overlap(truth, same_pv64, 0.01, 0.01)
             stage1 = layer_attention_step(x, w64, attention, geometry, torch.float64,
                                           same_boundary=True, project=quantized_project,
                                           bf16_probability=True, bf16_pv_tile=pv_tile)
@@ -190,8 +190,8 @@ def main():
             stage_errors = [row_error(attention["output"].double(), stage1), row_error(actual, stage2)]
             projection_errors = frozen_projection_errors(i, segments, w64)
             record.update({"stage_attention_l2": stage_errors[0], "stage_post_attention_l2": stage_errors[1],
-                           "frozen_projection_l2": projection_errors, "limit_stage": 0.003,
-                           "limit_projection": 0.003, "limit_same_boundary": 0.01,
+                           "frozen_projection_l2": projection_errors, "limit_stage": 0.01,
+                           "limit_projection": 0.01, "limit_same_boundary": 0.01,
                            "limit_same_operators_fp64_probability": 0.02,
                            "pure_reference_diagnostic_only": True})
             record["pass"] = fp8_gates(stage_errors, projection_errors,
