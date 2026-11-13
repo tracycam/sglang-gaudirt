@@ -9,10 +9,8 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 
 class GaudiRTTokenToKVPoolAllocator(TokenToKVPoolAllocator):
     def __init__(self, size, page_size, dtype, device, kvcache, need_sort):
-        if page_size not in (1, 16, 64) or need_sort or size % page_size or size >= 2**31:
-            raise ValueError("GaudiRT supports unsorted KV pages of size 1, 16, or 64")
-        if size // page_size > 8192 and page_size > 1:
-            raise ValueError("GaudiRT paged KV allocator supports at most 8192 pages")
+        if not isinstance(page_size, int) or page_size < 1 or need_sort or size % page_size or size >= 2**31:
+            raise ValueError("GaudiRT supports unsorted KV pages with positive integer page_size")
         if page_size == 1:
             super().__init__(size, dtype, device, kvcache, need_sort)
         else:

@@ -8,13 +8,33 @@ def rms_norm(self, x, residual=None, post_residual_addition=None):
             self.cast_x_before_out_mul or self.fp32_residual or self.override_orig_dtype is not None or
             not self.has_weight):
         raise ValueError("GaudiRT RMSNorm does not support these options")
+    weight = self.weight if self.weight.dtype == x.dtype else self.weight.to(x.dtype)
     if residual is None:
-        return torch.ops.gaudirt.rms_norm.default(x, self.weight, self.variance_epsilon)
-    return torch.ops.gaudirt.fused_add_rms_norm.default(x, residual, self.weight, self.variance_epsilon)
+        return torch.ops.gaudirt.rms_norm.default(x, weight, self.variance_epsilon)
+    return torch.ops.gaudirt.fused_add_rms_norm.default(x, residual, weight, self.variance_epsilon)
+
+
+def gemma_rms_norm(self, x, residual=None, post_residual_addition=None):
+    if getattr(self, "variance_size_override", None) is not None or not getattr(self, "has_weight", True):
+        raise ValueError("GaudiRT GemmaRMSNorm does not support these options")
+    weight = self.weight if self.weight.dtype == x.dtype else self.weight.to(x.dtype)
+    if residual is None:
+        if post_residual_addition is not None:
+            raise ValueError("GaudiRT GemmaRMSNorm requires residual when post_residual_addition is set")
+        return torch.ops.gaudirt.gemma_rms_norm.default(x, weight, self.variance_epsilon)
+    if post_residual_addition is not None:
+        residual = residual + post_residual_addition
+    return torch.ops.gaudirt.fused_add_gemma_rms_norm.default(x, residual, weight, self.variance_epsilon)
 
 
 def silu_and_mul(self, x):
     return torch.ops.gaudirt.silu_and_mul.default(x)
+
+
+def gelu_and_mul(self, x):
+    if self.approximate not in ("none", "tanh"):
+        raise ValueError(f"GaudiRT GeluAndMul only supports 'none' or 'tanh', got {self.approximate!r}")
+    return torch.ops.gaudirt.gelu_and_mul.default(x, self.approximate)
 
 
 def rotary_embedding(self, positions, query, key, offsets=None, fused_set_kv_buffer_arg=None):
@@ -22,13 +42,19 @@ def rotary_embedding(self, positions, query, key, offsets=None, fused_set_kv_buf
         raise ValueError("GaudiRT RoPE does not support offsets or fused KV writes")
     from sglang.srt.model_executor.forward_context import get_attn_backend
 
-    backend = get_attn_backend()
-    if backend.metadata is None or positions is not backend.positions:
-        raise RuntimeError("GaudiRT RoPE requires the active batch's validated positions")
+    try:
+        backend = get_attn_backend()
+    except Exception:
+        backend = None
     self._match_cos_sin_cache_dtype(query)
-    return torch.ops.gaudirt._rotary_embedding_validated.default(
-        query, key, self.cos_sin_cache, backend.rotary_positions, backend.rotary_header,
-        backend.rotary_context, self.head_size, self.rotary_dim, self.is_neox_style,
+    if (backend is not None and getattr(backend, "metadata", None) is not None and
+            positions is getattr(backend, "positions", None)):
+        return torch.ops.gaudirt._rotary_embedding_validated.default(
+            query, key, self.cos_sin_cache, backend.rotary_positions, backend.rotary_header,
+            backend.rotary_context, self.head_size, self.rotary_dim, self.is_neox_style,
+        )
+    return torch.ops.gaudirt.rotary_embedding_positions.default(
+        query, key, self.cos_sin_cache, positions, self.head_size, self.rotary_dim, self.is_neox_style,
     )
 
 
@@ -103,12 +129,25 @@ def _register_collective_custom_ops():
 
 
 def register_ops():
-    from sglang.srt.layers.activation import SiluAndMul
-    from sglang.srt.layers.layernorm import RMSNorm
+    import sglang.srt.layers.logits_processor as logits_processor
+    from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
+    from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
     from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
     from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 
-    for cls, fn in ((RMSNorm, rms_norm), (SiluAndMul, silu_and_mul),
+    for cls, fn in ((RMSNorm, rms_norm), (GemmaRMSNorm, gemma_rms_norm),
+                    (SiluAndMul, silu_and_mul), (GeluAndMul, gelu_and_mul),
                     (RotaryEmbedding, rotary_embedding)):
         MultiPlatformOp.register_oot_forward(cls, fn, "gaudirt")
+
+    orig_fused_softcap = logits_processor.fused_softcap
+    if not getattr(orig_fused_softcap, "_gaudirt_patched", False):
+        def _gaudirt_fused_softcap(full_logits, final_logit_softcapping):
+            if full_logits.device.type == "gaudirt":
+                return torch.ops.gaudirt.softcap_.default(full_logits, float(final_logit_softcapping))
+            return orig_fused_softcap(full_logits, final_logit_softcapping)
+
+        _gaudirt_fused_softcap._gaudirt_patched = True
+        logits_processor.fused_softcap = _gaudirt_fused_softcap
+
     _register_collective_custom_ops()

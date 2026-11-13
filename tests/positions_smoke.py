@@ -13,7 +13,7 @@ from sglang.srt.platforms import current_platform
 
 def main():
     current_platform.init_backend()
-    for total in (1, 3, 19, 137, 513, 4096):
+    for total in (1, 3, 19, 137, 513, 4096, 8192):
         lengths = [total] if total == 1 else [total // 2, total - total // 2]
         prefixes = [5 + index for index in range(len(lengths))]
         positions, offsets = current_platform.prepare_extend_positions(
@@ -26,7 +26,7 @@ def main():
         seq_lens = torch.tensor([start + length for start, length in zip(prefixes, lengths)])
         decode = current_platform.prepare_decode_positions(seq_lens, "gaudirt:0")
         assert decode.cpu().tolist() == [length - 1 for length in seq_lens.tolist()]
-    for total in (0, 4097):
+    for total in (0, 8193):
         try:
             current_platform.prepare_extend_positions([0], [total], total, "gaudirt:0")
         except ValueError:

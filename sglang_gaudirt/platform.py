@@ -107,10 +107,12 @@ class GaudiRTSRTPlatform(SRTPlatform):
             "tokenizer_worker_num", "detokenizer_worker_num",
         )):
             raise ValueError("GaudiRT currently requires pp=dp=nnodes=1 and one tokenizer/detokenizer worker")
-        if server_args.page_size not in (None, 1, 16, 64):
-            raise ValueError("GaudiRT supports KV page sizes 1, 16, and 64")
+        if server_args.page_size is not None and (not isinstance(server_args.page_size, int) or server_args.page_size < 1):
+            raise ValueError("GaudiRT supports positive integer KV page sizes")
         if server_args.page_size is None:
             server_args.page_size = 1
+        if getattr(server_args, "sampling_backend", None) is None:
+            server_args.sampling_backend = "gaudirt"
         server_args.disable_cuda_graph = True
         server_args.disable_custom_all_reduce = True
         if hasattr(server_args, "pre_warm_nccl"):
@@ -239,11 +241,15 @@ class GaudiRTSRTPlatform(SRTPlatform):
         gaudirt.configure_default_runtime(hbm_bytes=_hbm_budget())
 
         from sglang.srt.layers.attention.attention_registry import register_attention_backend
+        from sglang.srt.layers.sampler import register_sampler_backend
         from sglang.srt.server_args import add_attention_backend_choices
         from .attention import GaudiRTPagedAttnBackend
         from .ops import register_ops
+        from .sampler import GaudiRTSampler, install_sampling_batch_hooks
 
         register_attention_backend("gaudirt")(GaudiRTPagedAttnBackend)
         add_attention_backend_choices(["gaudirt"])
+        register_sampler_backend("gaudirt", GaudiRTSampler)
+        install_sampling_batch_hooks()
         register_ops()
         self._registered = True
