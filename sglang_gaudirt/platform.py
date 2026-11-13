@@ -140,6 +140,8 @@ class GaudiRTSRTPlatform(SRTPlatform):
         return "gaudirt"
 
     def prepare_model_forward(self, forward):
+        if not self._registered:
+            self.init_backend()
         from gaudirt.compiler import compile
         from sglang.srt.model_executor.forward_context import get_attn_backend
 

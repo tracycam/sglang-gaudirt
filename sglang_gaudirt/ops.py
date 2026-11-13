@@ -21,10 +21,10 @@ def gemma_rms_norm(self, x, residual=None, post_residual_addition=None):
     if residual is None:
         if post_residual_addition is not None:
             raise ValueError("GaudiRT GemmaRMSNorm requires residual when post_residual_addition is set")
-        return torch.ops.gaudirt.gemma_rms_norm.default(x, weight, self.variance_epsilon)
+        return torch.ops.gaudirt.rms_norm.default(x, weight, self.variance_epsilon, 1.0)
     if post_residual_addition is not None:
         residual = residual + post_residual_addition
-    return torch.ops.gaudirt.fused_add_gemma_rms_norm.default(x, residual, weight, self.variance_epsilon)
+    return torch.ops.gaudirt.fused_add_rms_norm.default(x, residual, weight, self.variance_epsilon, 1.0)
 
 
 def silu_and_mul(self, x):
@@ -71,12 +71,42 @@ def _resolve_device_group(group_name: str):
     return group
 
 
+def _resolve_sglang_comm_group(group_name: str):
+    import sglang.srt.distributed.parallel_state as ps_mod
+
+    groups = getattr(ps_mod, "_groups", None)
+    if isinstance(groups, dict) and group_name in groups:
+        entry = groups[group_name]
+        coord = entry() if callable(entry) else entry
+        if coord is None:
+            raise RuntimeError(f"GaudiRT FX: collective group {group_name!r} was destroyed")
+        return coord.device_group
+    return None
+
+
 def _register_collective_custom_ops():
     global _collective_ops_registered
     if _collective_ops_registered:
         return
     # Ensure sglang custom ops are defined on torch.ops.sglang before attaching PrivateUse1 kernels.
+    import gaudirt
     import sglang.srt.distributed.parallel_state  # noqa: F401
+
+    gaudirt.register_comm_group_resolver(_resolve_sglang_comm_group)
+    sgl_ns = getattr(torch.ops, "sglang", None)
+    if sgl_ns is not None:
+        kind = gaudirt._C.CollectiveKind
+        gaudirt.register_collective_op(sgl_ns.outplace_all_reduce, kind.AllReduce, "outplace", src_index=0, group_index=1)
+        gaudirt.register_collective_op(sgl_ns.inplace_all_reduce, kind.AllReduce, "inplace_self", src_index=0, group_index=1)
+        gaudirt.register_collective_op(
+            sgl_ns.reg_all_gather_into_tensor, kind.AllGather, "inplace_out", src_index=1, out_index=0, group_index=2
+        )
+        gaudirt.register_collective_op(
+            sgl_ns.reg_reduce_scatter_tensor, kind.ReduceScatter, "inplace_out", src_index=1, out_index=0, group_index=2
+        )
+        gaudirt.register_collective_op(
+            sgl_ns.reg_all_to_all_single, kind.AllToAll, "inplace_out", src_index=1, out_index=0, group_index=2
+        )
 
     @torch.library.impl("sglang::inplace_all_reduce", "PrivateUse1")
     def _gaudirt_inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
