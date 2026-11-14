@@ -144,7 +144,7 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
 
     def mark_capture_inputs(self):
         """Declare symbolic metadata only when the model graph is captured."""
-        torch._dynamo.mark_static(self.last_token_indices, 0)
+        torch._dynamo.mark_dynamic(self.last_token_indices, 0)
         if self.forward_batch.input_ids is not None:
             torch._dynamo.mark_dynamic(self.forward_batch.input_ids, 0)
         torch._dynamo.mark_dynamic(self.attention_plan, 0)
@@ -152,6 +152,8 @@ class GaudiRTPagedAttnBackend(AttentionBackend):
             torch._dynamo.mark_dynamic(plan, 0)
         for tensor in (self.rotary_positions, self.row_locations, self.row_requests):
             torch._dynamo.mark_dynamic(tensor, 0)
+        if self.rotary_header is not None:
+            torch._dynamo.mark_static(self.rotary_header, 0)
 
     def _forward(self, q, k, v, layer, forward_batch, save_kv_cache, kwargs):
         if self.metadata is None or forward_batch is not self.forward_batch:

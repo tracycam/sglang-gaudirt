@@ -158,6 +158,56 @@ def _register_collective_custom_ops():
     _collective_ops_registered = True
 
 
+def _register_grammar_mask_ops():
+    def _wrap_static_apply(cls, mask_tail: bool):
+        orig = cls.apply_vocab_mask
+        if getattr(orig, "_gaudirt_patched", False):
+            return
+
+        @staticmethod
+        def _gaudirt_apply(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+            if logits.device.type == "gaudirt":
+                torch.ops.gaudirt.apply_token_bitmask_inplace_.default(
+                    logits, vocab_mask, None, -1, mask_tail
+                )
+                return
+            orig(logits, vocab_mask)
+
+        _gaudirt_apply._gaudirt_patched = True
+        cls.apply_vocab_mask = _gaudirt_apply
+
+    def _wrap_method_apply(cls, mask_tail: bool):
+        orig = cls.apply_vocab_mask
+        if getattr(orig, "_gaudirt_patched", False):
+            return
+
+        def _gaudirt_apply(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+            if logits.device.type == "gaudirt":
+                torch.ops.gaudirt.apply_token_bitmask_inplace_.default(
+                    logits, vocab_mask, None, -1, mask_tail
+                )
+                return
+            orig(self, logits, vocab_mask)
+
+        _gaudirt_apply._gaudirt_patched = True
+        cls.apply_vocab_mask = _gaudirt_apply
+
+    try:
+        from sglang.srt.constrained import xgrammar_backend
+    except ImportError:
+        xgrammar_backend = None
+    if xgrammar_backend is not None:
+        _wrap_method_apply(xgrammar_backend.XGrammarGrammar, False)
+        _wrap_static_apply(xgrammar_backend.XGrammarGrammarBackend, False)
+
+    try:
+        from sglang.srt.constrained import llguidance_backend
+    except ImportError:
+        llguidance_backend = None
+    if llguidance_backend is not None:
+        _wrap_static_apply(llguidance_backend.GuidanceGrammar, True)
+
+
 def register_ops():
     import sglang.srt.layers.logits_processor as logits_processor
     from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
@@ -180,4 +230,5 @@ def register_ops():
         _gaudirt_fused_softcap._gaudirt_patched = True
         logits_processor.fused_softcap = _gaudirt_fused_softcap
 
+    _register_grammar_mask_ops()
     _register_collective_custom_ops()
