@@ -37,6 +37,7 @@ def _state_with_tp_measurement(self, request):
                 "total_ops": len(raw_sched),
                 "programs": sum(1 for k, _, _ in raw_sched if k == "program"),
                 "attentions": sum(1 for k, _, _ in raw_sched if k == "attention"),
+                "gather_rows": sum(1 for k, _, _ in raw_sched if k == "gather_rows"),
                 "collective_starts": sum(1 for k, _, _ in raw_sched if k == "collective_start"),
                 "dual_stream_collectives": sum(1 for k, _, dual in raw_sched if k == "collective_start" and dual),
             }
@@ -71,7 +72,7 @@ def _state_with_tp_measurement(self, request):
 Scheduler.get_internal_state = _state_with_tp_measurement
 
 # Only attach logit capture in non-benchmark numerical audit modes.
-if _CAPTURE_LOGITS_DIR and _MODE in ("reference_tp1", "tp2_cold", "tp2_warm"):
+if _CAPTURE_LOGITS_DIR and (_MODE == "reference_tp1" or _MODE.endswith(("_cold", "_warm"))):
     _orig_prepare = GaudiRTSRTPlatform.prepare_model_forward
 
     def _capture_prepare(self, forward):
@@ -237,7 +238,7 @@ def main():
     summary_path = Path(os.environ["GAUDIRT_SUMMARY_PATH"])
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if _MODE == "tp2_features":
+    if _MODE.endswith("_features"):
         from phase5a_feature_prompts import feature_prompts
 
         prompts = feature_prompts(vocabulary)
@@ -372,14 +373,14 @@ def main():
         rank_stats = _collect_rank_measurements(engine, tp_size)
         hl_during = _query_hl_smi()
 
-        if _MODE == "tp2_warm":
+        if _MODE.endswith("_warm"):
             for r_stat in rank_stats:
                 assert r_stat["recipe_cache"][0] > 0 and r_stat["recipe_cache"][1] == 0, (
                     f"expected >0 disk loads and 0 warm compiles on rank {r_stat['tp_rank']}, got {r_stat['recipe_cache']}"
                 )
 
         timings = []
-        if _MODE == "tp2_bench":
+        if _MODE.endswith("_bench"):
             bench_lengths = tuple(
                 int(x) for x in os.environ.get("GAUDIRT_BENCH_PROMPTS", "1024,4096").split(",") if x.strip()
             )
@@ -449,7 +450,7 @@ def main():
 
     if cold_summary := os.environ.get("GAUDIRT_COLD_SUMMARY"):
         cold_data = json.loads(Path(cold_summary).read_text())
-        assert generations == cold_data["generations"], "cold vs warm TP=2 tokens differ"
+        assert generations == cold_data["generations"], f"cold vs warm TP={tp_size} tokens differ"
         cold_logits_dir = Path(os.environ["GAUDIRT_COLD_LOGITS_DIR"])
         cur_logits_dir = Path(_CAPTURE_LOGITS_DIR)
         cold_files = sorted(cold_logits_dir.glob("prefill_*.pt"))
@@ -459,7 +460,7 @@ def main():
             c_t = torch.load(cf, weights_only=True)
             w_t = torch.load(wf, weights_only=True)
             assert torch.equal(c_t.view(torch.uint8), w_t.view(torch.uint8)), (
-                f"cold vs warm TP=2 prefill logits differ on {cf.name}"
+                f"cold vs warm TP={tp_size} prefill logits differ on {cf.name}"
             )
         comparisons["cold_vs_warm_bit_exact"] = True
 
@@ -488,9 +489,9 @@ def main():
             for rf, cf in zip(ref_files, cand_files):
                 m = _logit_metrics(torch.load(rf, weights_only=True), torch.load(cf, weights_only=True))
                 m["step"] = cf.stem
-                assert m["kl_ref_to_cand"] <= 0.01, f"TP=1 vs TP=2 KL too high: {m}"
+                assert m["kl_ref_to_cand"] <= 0.01, f"TP=1 vs TP={tp_size} KL too high: {m}"
                 logit_checks.append(m)
-        comparisons["tp1_vs_tp2"] = {
+        comparisons[f"tp1_vs_tp{tp_size}"] = {
             "token_comparisons": token_matches,
             "prefill_logit_metrics": logit_checks,
         }

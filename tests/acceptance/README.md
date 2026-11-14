@@ -123,3 +123,107 @@ capture with `GAUDIRT_AUDIT_PV_TILE=512`. Each must satisfy the full per-layer
 and conditioned KL gates. The primary FP32 reference keeps attention
 probabilities in FP32. Without cross-tree mode, the main audit still requires
 byte-identical same-path outputs.
+
+## Phase 5B Serving Closeout (`TP=4`, Concurrency, Structured Output & Multi-Arch)
+
+Unit-level standalone smokes in `$GAUDIRT_TESTS` verify dynamic FX/eager kernels,
+vocab bitmask, and `TP=4` AllGather+RankSum primitives before running SGLang
+end-to-end gates:
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 $GAUDIRT_TESTS/dynamic_eager_ops_smoke.py
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 $GAUDIRT_TESTS/vocab_bitmask_device_smoke.py
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 $GAUDIRT_TESTS/dynamic_gather_rows_fx_smoke.py
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 HABANA_VISIBLE_MODULES=0,1,2,3 python3 $GAUDIRT_TESTS/tp4_gather_reduce_smoke.py
+```
+
+### Structured Output (`xgrammar` / `llguidance`) and Multi-Arch `TP=4` Parity
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 SGLANG_PLATFORM=gaudirt \
+HABANA_VISIBLE_MODULES=0,1 \
+GAUDIRT_SMOLLM2_MODEL=$SMOLLM2_DIR \
+GAUDIRT_NANBEIGE_2L_MODEL=$NANBEIGE_2L_DIR \
+GAUDIRT_STRUCTURED_RECEIPT=$ARTIFACTS/structured_output_receipt.json \
+python3 tests/acceptance/sglang_structured_output_smoke.py
+
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 SGLANG_PLATFORM=gaudirt \
+HABANA_VISIBLE_MODULES=0,1,2,3 \
+GAUDIRT_MULTI_ARCH_TP4_RECEIPT=$ARTIFACTS/multi_arch_tp4_receipt.json \
+python3 tests/acceptance/sglang_multi_arch_tp4_smoke.py
+```
+
+### 52L `TP=1` vs `TP=4` Deterministic Text-Mode Gate
+
+With W8A8 FP8 weights, pass natural-text documents via `GAUDIRT_TEXT_MODE=1` and
+`GAUDIRT_PROMPT_DOCUMENTS` (see `P-BENCH-18` for BOS attention-sink sensitivity
+on synthetic BOS-less token IDs) and set `GAUDIRT_HBM_BYTES=85899345920`:
+
+```bash
+COMMON_ENV="TORCH_DEVICE_BACKEND_AUTOLOAD=0 SGLANG_PLATFORM=gaudirt \
+GAUDIRT_TARGET_MODEL=$MODEL_DIR GAUDIRT_EXPECT_LAYERS=52 \
+GAUDIRT_HBM_BYTES=85899345920 GAUDIRT_TEXT_MODE=1 \
+GAUDIRT_PROMPT_DOCUMENTS=$MODEL_DIR/README.md:$OTHER_PUBLIC_DOCUMENT"
+
+env $COMMON_ENV HABANA_VISIBLE_MODULES=0 GAUDIRT_TP_GATE_MODE=reference_tp1 \
+  GAUDIRT_TP_LOGITS_DIR=$ARTIFACTS/tp1_logits \
+  GAUDIRT_SUMMARY_PATH=$ARTIFACTS/nanbeige52_tp1_ref.json \
+  python3 tests/acceptance/sglang_phase5b_tp2_gate.py
+
+env $COMMON_ENV HABANA_VISIBLE_MODULES=0,1,2,3 GAUDIRT_TP_SIZE=4 \
+  GAUDIRT_TP_GATE_MODE=tp2_cold \
+  GAUDIRT_TP_LOGITS_DIR=$ARTIFACTS/tp4_cold_logits \
+  GAUDIRT_TP1_LOGITS_DIR=$ARTIFACTS/tp1_logits \
+  GAUDIRT_TP1_SUMMARY=$ARTIFACTS/nanbeige52_tp1_ref.json \
+  GAUDIRT_SUMMARY_PATH=$ARTIFACTS/nanbeige52_tp4_cold.json \
+  python3 tests/acceptance/sglang_phase5b_tp2_gate.py
+
+env $COMMON_ENV HABANA_VISIBLE_MODULES=0,1,2,3 GAUDIRT_TP_SIZE=4 \
+  GAUDIRT_TP_GATE_MODE=tp2_warm \
+  GAUDIRT_COLD_SUMMARY=$ARTIFACTS/nanbeige52_tp4_cold.json \
+  GAUDIRT_COLD_LOGITS_DIR=$ARTIFACTS/tp4_cold_logits \
+  GAUDIRT_TP_LOGITS_DIR=$ARTIFACTS/tp4_warm_logits \
+  GAUDIRT_TP1_LOGITS_DIR=$ARTIFACTS/tp1_logits \
+  GAUDIRT_TP1_SUMMARY=$ARTIFACTS/nanbeige52_tp1_ref.json \
+  GAUDIRT_SUMMARY_PATH=$ARTIFACTS/nanbeige52_tp4_warm.json \
+  python3 tests/acceptance/sglang_phase5b_tp2_gate.py
+
+env $COMMON_ENV HABANA_VISIBLE_MODULES=0,1,2,3 GAUDIRT_TP_SIZE=4 \
+  GAUDIRT_TP_GATE_MODE=tp2_features \
+  GAUDIRT_SUMMARY_PATH=$ARTIFACTS/nanbeige52_tp4_features.json \
+  python3 tests/acceptance/sglang_phase5b_tp2_gate.py
+
+env $COMMON_ENV HABANA_VISIBLE_MODULES=0,1,2,3 GAUDIRT_TP_SIZE=4 \
+  GAUDIRT_TP_GATE_MODE=tp2_bench \
+  GAUDIRT_SUMMARY_PATH=$ARTIFACTS/nanbeige52_tp4_bench.json \
+  python3 tests/acceptance/sglang_phase5b_tp2_gate.py
+```
+
+### Continuous Batching Mixed Functional & `B=1/8/16/32` Concurrency Gate
+
+```bash
+# TP=2 throughput benchmark
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 SGLANG_PLATFORM=gaudirt \
+HABANA_VISIBLE_MODULES=0,1 GAUDIRT_TP_SIZE=2 \
+GAUDIRT_TARGET_MODEL=$MODEL_DIR GAUDIRT_EXPECT_LAYERS=52 \
+GAUDIRT_CONCURRENCY_MODE=throughput_bench \
+GAUDIRT_SUMMARY_PATH=$ARTIFACTS/nanbeige52_tp2_concurrency_bench.json \
+python3 tests/acceptance/sglang_phase5b_concurrency_gate.py
+
+# TP=4 functional mixed-batch (canaries + xgrammar JSON/regex + radix reuse)
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 SGLANG_PLATFORM=gaudirt \
+HABANA_VISIBLE_MODULES=0,1,2,3 GAUDIRT_TP_SIZE=4 \
+GAUDIRT_TARGET_MODEL=$MODEL_DIR GAUDIRT_EXPECT_LAYERS=52 \
+GAUDIRT_CONCURRENCY_MODE=functional_mixed \
+GAUDIRT_SUMMARY_PATH=$ARTIFACTS/nanbeige52_tp4_concurrency_functional.json \
+python3 tests/acceptance/sglang_phase5b_concurrency_gate.py
+
+# TP=4 throughput benchmark (B=1,8,16,32 with zero steady-state recompiles)
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 SGLANG_PLATFORM=gaudirt \
+HABANA_VISIBLE_MODULES=0,1,2,3 GAUDIRT_TP_SIZE=4 \
+GAUDIRT_TARGET_MODEL=$MODEL_DIR GAUDIRT_EXPECT_LAYERS=52 \
+GAUDIRT_CONCURRENCY_MODE=throughput_bench \
+GAUDIRT_SUMMARY_PATH=$ARTIFACTS/nanbeige52_tp4_concurrency_bench.json \
+python3 tests/acceptance/sglang_phase5b_concurrency_gate.py
+```
+
